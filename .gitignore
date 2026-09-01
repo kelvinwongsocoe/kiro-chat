@@ -1,0 +1,17 @@
+# Installed packages. Restore with: npm install
+node_modules/
+
+# Compiled output. Rebuild with: npm run compile
+out/
+
+# Editor and OS noise
+.vscode/
+.DS_Store
+Thumbs.db
+
+# The packaged extension is committed on purpose: install-windows.bat and
+# install.sh both expect kiro-chat.vsix to sit next to them, so anyone who
+# clones this can install it without a toolchain. Delete the "!" line if you
+# would rather attach the .vsix to a GitHub release instead.
+*.vsix
+!kiro-chat.vsix

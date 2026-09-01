@@ -1,0 +1,212 @@
+{
+  "name": "kiro-chat",
+  "displayName": "Kiro Chat",
+  "description": "Chat with the Kiro agent inside VS Code, like Copilot Chat.",
+  "version": "0.4.1",
+  "publisher": "local",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Chat",
+    "Programming Languages"
+  ],
+  "activationEvents": [],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "kiroChat",
+          "title": "Kiro Chat",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "kiroChat": [
+        {
+          "id": "kiroChat.view",
+          "name": "Chat",
+          "type": "webview",
+          "icon": "media/icon.svg",
+          "contextualTitle": "Kiro Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "kiroChat.focus",
+        "title": "Kiro Chat: Open Chat"
+      },
+      {
+        "command": "kiroChat.newSession",
+        "title": "Kiro Chat: New Session",
+        "icon": "$(add)"
+      },
+      {
+        "command": "kiroChat.restart",
+        "title": "Kiro Chat: Restart Agent",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "kiroChat.stop",
+        "title": "Kiro Chat: Stop Current Reply",
+        "icon": "$(stop)"
+      },
+      {
+        "command": "kiroChat.explainSelection",
+        "title": "Kiro Chat: Explain Selection"
+      },
+      {
+        "command": "kiroChat.showLog",
+        "title": "Kiro Chat: Show Log"
+      },
+      {
+        "command": "kiroChat.pickModel",
+        "title": "Kiro Chat: Change Model"
+      },
+      {
+        "command": "kiroChat.about",
+        "title": "Kiro Chat: About and Check Version"
+      },
+      {
+        "command": "kiroChat.addFileToContext",
+        "title": "Kiro Chat: Add to Chat Context"
+      },
+      {
+        "command": "kiroChat.showUsage",
+        "title": "Kiro Chat: Show Usage",
+        "icon": "$(graph)"
+      },
+      {
+        "command": "kiroChat.moveView",
+        "title": "Kiro Chat: Move Panel (sidebar, bottom or right)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "kiroChat.newSession",
+          "when": "view == kiroChat.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "kiroChat.restart",
+          "when": "view == kiroChat.view",
+          "group": "navigation@2"
+        },
+        {
+          "command": "kiroChat.showUsage",
+          "when": "view == kiroChat.view",
+          "group": "navigation@0"
+        }
+      ],
+      "editor/context": [
+        {
+          "command": "kiroChat.explainSelection",
+          "when": "editorHasSelection",
+          "group": "kiro@1"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "kiroChat.addFileToContext",
+          "group": "kiro@1"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "kiroChat.focus",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k"
+      }
+    ],
+    "configuration": {
+      "title": "Kiro Chat",
+      "properties": {
+        "kiroChat.command": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Leave empty and the extension will find `kiro-cli` for you. Only set this if it cannot. Run `which kiro-cli` in a terminal to get the full path."
+        },
+        "kiroChat.args": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "markdownDescription": "Extra arguments added before `acp`, for example `[\"--agent\", \"my-agent\"]`."
+        },
+        "kiroChat.env": {
+          "type": "object",
+          "default": {},
+          "additionalProperties": {
+            "type": "string"
+          },
+          "description": "Extra environment variables for the Kiro process."
+        },
+        "kiroChat.allowFileWrites": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let Kiro write files in your workspace. Turn this off to make the chat read-only."
+        },
+        "kiroChat.autoApproveTools": {
+          "type": "boolean",
+          "default": false,
+          "description": "Approve every tool Kiro asks to run without asking you first. Leave this off unless you trust the workspace."
+        },
+        "kiroChat.model": {
+          "type": "string",
+          "default": "",
+          "description": "The model Kiro uses. Leave empty for Kiro's default, which picks one per task. The dropdown in the chat panel sets this for you."
+        },
+        "kiroChat.sendSelection": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send the code you have highlighted along with your message. You can also switch this off per message using the chip above the text box."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile",
+    "package": "npx --yes @vscode/vsce package --allow-missing-repository --out kiro-chat.vsix",
+    "build": "npm install && npm run compile && npm run package",
+    "test": "npm run compile && node --test \"test/*.test.js\""
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  },
+  "icon": "media/icon.png",
+  "keywords": [
+    "kiro",
+    "chat",
+    "ai",
+    "agent",
+    "acp",
+    "assistant"
+  ],
+  "galleryBanner": {
+    "color": "#1C202C",
+    "theme": "dark"
+  },
+  "qna": false,
+  "capabilities": {
+    "virtualWorkspaces": {
+      "supported": false,
+      "description": "Kiro needs real files on disk to work with."
+    },
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "Kiro can read and write files in the folder, so the folder must be trusted."
+    }
+  }
+}
