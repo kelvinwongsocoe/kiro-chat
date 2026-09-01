@@ -1,0 +1,34 @@
+name: Build
+
+# Compiles, tests and packages on Windows. Nothing is published anywhere.
+# Delete this file if you would rather only ever build on your own machine.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - run: npm test
+
+      - run: npm run package
+
+      # Download from the run's Artifacts tab to install a branch by hand.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiro-chat-vsix
+          path: kiro-chat.vsix
+          if-no-files-found: error

@@ -121,8 +121,7 @@
     "keybindings": [
       {
         "command": "kiroChat.focus",
-        "key": "ctrl+alt+k",
-        "mac": "cmd+alt+k"
+        "key": "ctrl+alt+k"
       }
     ],
     "configuration": {
@@ -176,7 +175,7 @@
     "compile": "tsc -p ./",
     "watch": "tsc -watch -p ./",
     "vscode:prepublish": "npm run compile",
-    "package": "npx --yes @vscode/vsce package --allow-missing-repository --out kiro-chat.vsix",
+    "package": "npx --yes @vscode/vsce package --out kiro-chat.vsix",
     "build": "npm install && npm run compile && npm run package",
     "test": "npm run compile && node --test \"test/*.test.js\""
   },
@@ -208,5 +207,13 @@
       "supported": false,
       "description": "Kiro can read and write files in the folder, so the folder must be trusted."
     }
-  }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/kelvinwongsocoe/kiro-chat.git"
+  },
+  "bugs": {
+    "url": "https://github.com/kelvinwongsocoe/kiro-chat/issues"
+  },
+  "homepage": "https://github.com/kelvinwongsocoe/kiro-chat#readme"
 }

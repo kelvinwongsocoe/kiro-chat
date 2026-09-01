@@ -1,17 +1,14 @@
-// How Kiro gets launched. These only differ on Windows, where the CLI is often
-// a .cmd shim and Node refuses to spawn one without a shell.
+// How Kiro gets launched. The CLI is often a .cmd shim, and Node refuses to
+// spawn one without a shell.
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { needsShell, quote } = require("../out/acpClient");
 
-const onWindows = process.platform === "win32";
-
 test("batch shims go through the shell, real executables do not", () => {
-  assert.equal(needsShell("C:\\Users\\me\\kiro-cli.cmd"), onWindows);
-  assert.equal(needsShell("C:\\Users\\me\\kiro-cli.BAT"), onWindows);
+  assert.equal(needsShell("C:\\Users\\me\\kiro-cli.cmd"), true);
+  assert.equal(needsShell("C:\\Users\\me\\kiro-cli.BAT"), true);
   assert.equal(needsShell("C:\\Users\\me\\kiro-cli.exe"), false);
-  assert.equal(needsShell("/usr/local/bin/kiro-cli"), false);
   assert.equal(needsShell("wsl"), false);
 });
 

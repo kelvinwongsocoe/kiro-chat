@@ -1,10 +1,11 @@
 .vscode/**
+.github/**
+.gitignore
 node_modules/**
 src/**
 test/**
 out/**/*.map
 **/*.ts
 tsconfig.json
-install.sh
 install-windows.bat
 *.vsix

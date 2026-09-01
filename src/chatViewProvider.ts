@@ -46,8 +46,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       onTool: (tool) => this.post({ type: "tool", tool }),
       onTurnEnd: (reason) => this.post({ type: "turnEnd", reason }),
       onError: (message) => this.post({ type: "error", text: message }),
-      onNeedsSetup: (reason) =>
-        this.post({ type: "needsSetup", reason, platform: process.platform }),
+      onNeedsSetup: (reason) => this.post({ type: "needsSetup", reason }),
       onModels: (models, currentModelId) =>
         this.post({ type: "models", models, currentModelId }),
       onUsage: (usage) => this.post({ type: "usage", usage }),
@@ -465,17 +464,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   // ---- setup helpers ---------------------------------------------------
 
   private installCommand(): string {
-    if (process.platform === "win32") {
-      return "irm 'https://cli.kiro.dev/install.ps1' | iex";
-    }
-    return "curl -fsSL https://cli.kiro.dev/install | bash";
+    return "irm 'https://cli.kiro.dev/install.ps1' | iex";
   }
 
   private runInTerminal(command: string): void {
-    const isWindows = process.platform === "win32";
     const terminal = vscode.window.createTerminal({
       name: "Kiro setup",
-      shellPath: isWindows ? "powershell.exe" : undefined,
+      shellPath: "powershell.exe",
     });
     terminal.show();
     terminal.sendText(command, false);

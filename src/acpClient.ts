@@ -21,9 +21,9 @@ export interface AcpClientOptions {
   onExit: (code: number | null, signal: string | null) => void;
 }
 
-/** True for the Windows batch shims that Node will not spawn directly. */
+/** True for the batch shims that Node will not spawn directly. */
 export function needsShell(command: string): boolean {
-  return process.platform === "win32" && /\.(cmd|bat)$/i.test(command.trim());
+  return /\.(cmd|bat)$/i.test(command.trim());
 }
 
 /** Wrap in double quotes for cmd.exe when there is anything to protect. */

@@ -21,17 +21,6 @@ press Enter to run it. Nothing runs behind your back.
 If Kiro is already installed and you're signed in, the panel skips all of that and is ready
 to chat.
 
-## Setup on Mac and Linux
-
-Same idea, different first step:
-
-```bash
-cd kiro-chat
-bash install.sh
-```
-
-Then restart VS Code and click the Kiro icon.
-
 ## Where the panel lives
 
 It starts in the left bar, but it does not have to stay there. **Drag the Kiro icon** to the
@@ -49,7 +38,7 @@ sidebar themselves. Only you can drag it there. That is why it starts on the lef
 
 - Open the panel and you get a fresh chat, already connected. No button to press first.
 - Type, press **Enter** to send. **Shift+Enter** for a new line.
-- Press `Ctrl+Alt+K` (`Cmd+Alt+K` on Mac) to jump to the chat from anywhere.
+- Press `Ctrl+Alt+K` to jump to the chat from anywhere.
 - Whatever file you have open, and any text you've highlighted, is sent along so Kiro knows
   what you're looking at.
 - Right-click highlighted code and choose **Kiro Chat: Explain Selection**.
@@ -73,19 +62,6 @@ That part is handled properly:
   to uninstall first.
 
 Run **Kiro Chat: About and Check Version** any time to see which version you are on.
-
-### If you want real automatic updates
-
-Publish it to Open VSX, which is free and is the registry Kiro's own IDE uses:
-
-```bash
-npm install -g ovsx
-npx ovsx publish kiro-chat.vsix -p YOUR_TOKEN
-```
-
-Change `publisher` in `package.json` to your own Open VSX publisher name first. Once it is
-published, install it by searching the Extensions panel instead of using the `.vsix`, and
-VS Code will keep it updated on its own from then on.
 
 ## Context: telling Kiro what to look at
 
@@ -188,23 +164,21 @@ the result into Settings, search "Kiro Chat", field **Command**.
 
 ## Which systems this works on
 
-Mac, Linux, and Windows. The extension itself is plain VS Code code and runs anywhere
-VS Code runs. What differs is how Kiro's CLI is installed underneath.
+**Windows only.** Mac and Linux support was taken out on purpose, so the code has one path
+through it instead of three. On any other system the extension says so and stops rather
+than failing later with a confusing "kiro-cli not found".
 
-**Mac and Linux.** Use the install line above. Nothing else to do.
+Kiro CLI 2.0 and newer installs natively on Windows. Use Kiro's PowerShell installer, then
+run `kiro-cli login`. To find it, the extension checks the usual install folders — starting
+with `%LOCALAPPDATA%\Kiro-Cli\` — then `where kiro-cli`, and finally WSL.
 
-**Windows.** Kiro CLI 2.0 and newer installs natively, so use Kiro's PowerShell installer
-rather than the `curl` line above, then run `kiro-cli login`. The extension checks the
-normal Windows install folders, then `where kiro-cli`, and finally WSL, so either setup is
-found on its own.
-
-If you are on an older Kiro CLI that only runs under WSL, that still works. The extension
+If you are on an older Kiro CLI that only runs under WSL, that still works: the extension
 finds it and runs it through WSL for you. One thing to know: keep your project inside the
 Linux side of WSL (`/home/you/...`) rather than a Windows drive (`/mnt/c/...`), or file
 reads get slow.
 
-The `install.sh` script needs bash. On Windows, run it from Git Bash or WSL, or just
-install the `.vsix` by hand as described above.
+If your `kiro-cli` is a `.cmd` or `.bat` shim rather than a real `.exe`, that works too —
+those are started through the shell, since Node will not launch them directly.
 
 ## How this works
 
@@ -247,6 +221,19 @@ All optional.
 Settings survive upgrades. If the saved path to Kiro ever stops working, for example
 because Kiro updated itself and moved, the extension clears it, goes back to searching, and
 tells you it did so, rather than just failing.
+
+## Building it yourself
+
+```
+npm run build
+```
+
+That installs, compiles and writes `kiro-chat.vsix` next to `install-windows.bat`. Then
+double-click `install-windows.bat` to install it, and restart VS Code.
+
+`npm test` runs the checks on their own. There is one GitHub Actions workflow,
+`.github/workflows/ci.yml`, which does the same three steps on Windows for every push. It
+publishes nothing — the extension is installed from the `.vsix`, not from the Marketplace.
 
 ## Not built yet
 

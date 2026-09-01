@@ -728,12 +728,11 @@
     return li;
   }
 
-  function showSetup(reason, platform) {
+  function showSetup(reason) {
     messagesEl.innerHTML = "";
     current = null;
     buffer = "";
 
-    const isWindows = platform === "win32";
     const missing = reason === "missing";
     const wrap = document.createElement("div");
     wrap.className = "setup";
@@ -755,9 +754,7 @@
       steps.appendChild(
         stepRow(
           "Install Kiro",
-          isWindows
-            ? "Opens PowerShell and types the install command. Press Enter to run it."
-            : "Opens a terminal and types the install command. Press Enter to run it.",
+          "Opens PowerShell and types the install command. Press Enter to run it.",
           "Install Kiro",
           "installKiro"
         )
@@ -766,7 +763,7 @@
     steps.appendChild(
       stepRow(
         "Sign in",
-        "Opens a terminal with the login command. It will send you to your browser.",
+        "Opens PowerShell with the login command. It will send you to your browser.",
         "Sign in",
         "signIn"
       )
@@ -904,7 +901,7 @@
         break;
 
       case "needsSetup":
-        showSetup(message.reason, message.platform);
+        showSetup(message.reason);
         break;
 
       case "cleared":

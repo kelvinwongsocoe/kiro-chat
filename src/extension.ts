@@ -4,6 +4,17 @@ import { runStartupChecks, describeInstall } from "./lifecycle";
 
 export function activate(context: vscode.ExtensionContext): void {
   const output = vscode.window.createOutputChannel("Kiro Chat");
+
+  // This build is Windows only: it looks in Windows install folders, runs
+  // PowerShell, and falls back to WSL. Say so plainly rather than letting it
+  // fail later as a puzzling "kiro-cli not found".
+  if (process.platform !== "win32") {
+    output.appendLine(`Kiro Chat is Windows only; this is ${process.platform}.`);
+    vscode.window.showErrorMessage(
+      "Kiro Chat only works on Windows. The panel will open but cannot start Kiro."
+    );
+  }
+
   const provider = new ChatViewProvider(context.extensionUri, output);
 
   context.subscriptions.push(
