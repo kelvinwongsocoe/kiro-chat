@@ -4,6 +4,7 @@ import * as path from "node:path";
 import * as fs from "node:fs/promises";
 import { AcpClient } from "./acpClient";
 import { findKiro } from "./findKiro";
+import { looksLikeSignIn } from "./startupError";
 import {
   creditRateOf,
   describeContextWindow,
@@ -44,6 +45,13 @@ export type ContentBlock =
   | { type: "image"; data: string; mimeType: string }
   | { type: "resource_link"; uri: string; name: string; mimeType?: string };
 
+/** Somewhere other than the panel for one turn's output to go. */
+export interface TurnSink {
+  onText: (text: string) => void;
+  onThought?: (text: string) => void;
+  onTool?: (tool: { id: string; title: string; status: string }) => void;
+}
+
 export interface SessionEvents {
   onStatus: (status: SessionStatus, detail?: string) => void;
   onText: (text: string) => void;
@@ -51,7 +59,7 @@ export interface SessionEvents {
   onTool: (tool: { id: string; title: string; status: string }) => void;
   onTurnEnd: (reason?: string) => void;
   onError: (message: string) => void;
-  onNeedsSetup: (reason: "missing" | "signin") => void;
+  onNeedsSetup: (reason: "missing" | "signin" | "failed", detail?: string) => void;
   onModels: (models: ModelInfo[], currentModelId: string) => void;
   onUsage: (usage: UsageInfo) => void;
   onCapabilities: (caps: { image: boolean }) => void;
@@ -83,7 +91,16 @@ export class KiroSession {
   private currentModelId = "";
   private usage: UsageInfo = {};
   private supportsImages = false;
+  private supportsLoad = false;
+  /** True while session/load runs, so a replay does not double-paint. */
+  private replaying = false;
   private textSpy: ((text: string) => void) | undefined;
+  /**
+   * Where this turn's output goes, when it is not the panel. VS Code's own
+   * chat box asks through `sendTo`, and its answer belongs in its response
+   * stream rather than in the webview's transcript.
+   */
+  private sink: TurnSink | undefined;
 
   constructor(
     private readonly output: vscode.OutputChannel,
@@ -96,6 +113,50 @@ export class KiroSession {
 
   get canSendImages(): boolean {
     return this.supportsImages;
+  }
+
+  /** Kiro's id for the running conversation, so it can be reopened later. */
+  get currentSessionId(): string | undefined {
+    return this.sessionId;
+  }
+
+  get canLoadSessions(): boolean {
+    return this.supportsLoad;
+  }
+
+  /**
+   * Reopen a past conversation so Kiro has its memory back and the user can
+   * carry on talking. Verified against kiro-cli 2.20.2: a session id survives
+   * the CLI process dying, so this works after a restart of VS Code.
+   *
+   * The panel redraws from our own stored transcript, not from Kiro. Kiro may
+   * replay the conversation as session/update notifications while this call
+   * is in flight, which would paint every message a second time, so those are
+   * swallowed until it returns.
+   */
+  async loadSession(sessionId: string): Promise<void> {
+    await this.ensureReady();
+    if (!this.client?.isRunning) throw new Error("Kiro is not connected.");
+
+    this.replaying = true;
+    try {
+      const result = await this.client.request(
+        "session/load",
+        { sessionId, cwd: this.workspaceRoot(), mcpServers: [] },
+        30000
+      );
+      this.sessionId = sessionId;
+      // Loading answers with the same model block a new session does — which
+      // means it carries no credit rate either. Rebuilding the list from it
+      // would drop the rates the picker shows, so ask for them again.
+      if (result) {
+        this.readModels(result);
+        void this.enrichModels();
+      }
+      this.setStatus("ready");
+    } finally {
+      this.replaying = false;
+    }
   }
 
   private setStatus(status: SessionStatus, detail?: string): void {
@@ -175,6 +236,8 @@ export class KiroSession {
       );
 
       this.supportsImages = Boolean(init?.agentCapabilities?.promptCapabilities?.image);
+      this.supportsLoad = Boolean(init?.agentCapabilities?.loadSession);
+      this.output.appendLine(`Past chats can be reopened: ${this.supportsLoad}`);
       this.output.appendLine(`Images accepted in prompts: ${this.supportsImages}`);
       this.events.onCapabilities({ image: this.supportsImages });
 
@@ -199,8 +262,33 @@ export class KiroSession {
       const message = err instanceof Error ? err.message : String(err);
       this.setStatus("stopped");
       this.output.appendLine(`Failed to start "${command}": ${message}`);
-      this.events.onNeedsSetup("signin");
+      // Only blame the login when the error actually says so. This used to
+      // report "signin" for every failure in here — a dropped pipe, a slow
+      // spawn, a missing session id — which sent people off to log in again
+      // when they were already signed in and hid what really broke.
+      this.events.onNeedsSetup(looksLikeSignIn(message) ? "signin" : "failed", message);
       throw err;
+    }
+  }
+
+  /**
+   * Ask Kiro something on behalf of VS Code's own chat box, streaming the
+   * answer into the caller's sink instead of the panel's transcript.
+   *
+   * The two share one Kiro session deliberately: the conversation is the same
+   * conversation whichever box it was typed into, so credits, context and
+   * memory all stay in one place rather than running a second agent.
+   */
+  async sendTo(blocks: ContentBlock[], sink: TurnSink): Promise<void> {
+    if (this.sink) throw new Error("Kiro is already answering another question.");
+    if (this.status === "busy") {
+      throw new Error("Kiro is still working on the last message. Wait for it to finish.");
+    }
+    this.sink = sink;
+    try {
+      await this.send(blocks);
+    } finally {
+      this.sink = undefined;
     }
   }
 
@@ -221,8 +309,12 @@ export class KiroSession {
         prompt: usable,
         content: usable,
       });
-      this.events.onTurnEnd(result?.stopReason);
+      // A sink means someone else asked and is showing the answer; the panel
+      // must not also declare the turn over, and the error belongs to the
+      // caller rather than to the transcript.
+      if (!this.sink) this.events.onTurnEnd(result?.stopReason);
     } catch (err) {
+      if (this.sink) throw err;
       this.events.onError(err instanceof Error ? err.message : String(err));
       this.events.onTurnEnd("error");
     } finally {
@@ -411,6 +503,10 @@ export class KiroSession {
       this.output.appendLine(`[notify] ${method}`);
       return;
     }
+    // A load may replay the whole conversation. The panel already has it
+    // from its own store, so ignore the echo rather than paint it twice.
+    if (this.replaying) return;
+
     const update = params?.update ?? params;
 
     // Some builds attach the meter to an ordinary update rather than sending a
@@ -432,24 +528,30 @@ export class KiroSession {
     switch (kind) {
       case "agent_message_chunk": {
         const text = contentToText(update.content);
-        if (this.textSpy) {
-          this.textSpy(text);
-        } else {
-          this.events.onText(text);
-        }
+        // A command is collecting, a chat participant is streaming, or the
+        // panel is the audience — in that order of precedence.
+        if (this.textSpy) this.textSpy(text);
+        else if (this.sink) this.sink.onText(text);
+        else this.events.onText(text);
         break;
       }
-      case "agent_thought_chunk":
-        this.events.onThought(contentToText(update.content));
+      case "agent_thought_chunk": {
+        const thought = contentToText(update.content);
+        if (this.sink) this.sink.onThought?.(thought);
+        else this.events.onThought(thought);
         break;
+      }
       case "tool_call":
-      case "tool_call_update":
-        this.events.onTool({
+      case "tool_call_update": {
+        const tool = {
           id: String(update.toolCallId ?? update.id ?? Math.random()),
           title: String(update.title ?? update.rawInput?.command ?? update.kind ?? "tool"),
           status: String(update.status ?? "running"),
-        });
+        };
+        if (this.sink) this.sink.onTool?.(tool);
+        else this.events.onTool(tool);
         break;
+      }
       case "turn_end":
         this.events.onTurnEnd(update.stopReason);
         break;

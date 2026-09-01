@@ -39,8 +39,8 @@ body {
 
 .status {
   flex: 0 0 auto;
-  padding: 4px var(--gap);
-  font-size: 0.85em;
+  padding: 5px var(--gap);
+  font-size: 0.8em;
   color: var(--vscode-descriptionForeground);
   border-bottom: 1px solid var(--vscode-panel-border);
 }
@@ -73,7 +73,8 @@ body {
   padding: var(--gap);
   display: flex;
   flex-direction: column;
-  gap: var(--gap);
+  /* Turns need more air than the old bubbles did to read as separate. */
+  gap: 18px;
 }
 
 .empty {
@@ -97,13 +98,22 @@ body {
   overflow-wrap: anywhere;
 }
 
+/*
+ * One reading axis. Both roles run the full width and the label is what tells
+ * them apart, so the eye travels straight down instead of side to side — which
+ * is what makes this readable in a sidebar three inches wide.
+ */
+.msg-role {
+  margin-bottom: 3px;
+  font-size: 0.72em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.8;
+}
+
 .msg.user {
-  align-self: flex-end;
-  max-width: 88%;
-  padding: 7px 11px;
-  border-radius: var(--radius);
-  background: var(--vscode-input-background);
-  border: 1px solid var(--vscode-input-border, var(--vscode-panel-border));
+  color: var(--vscode-descriptionForeground);
   white-space: pre-wrap;
 }
 
@@ -274,12 +284,13 @@ button:disabled {
 }
 
 .setup h2 {
-  font-size: 1.15em;
+  font-size: 1.1em;
+  font-weight: 600;
   margin: 0 0 6px;
 }
 
 .setup > p {
-  margin: 0 0 16px;
+  margin: 0 0 20px;
   color: var(--vscode-descriptionForeground);
 }
 
@@ -288,43 +299,93 @@ button:disabled {
   counter-reset: step;
   margin: 0 0 16px;
   padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
 }
 
-.setup-steps li {
+/*
+ * Each step shows where it has got to. The marker is the whole status
+ * indicator — a number while there is something to do, a tick once the panel
+ * has seen it happen — so the user can watch the install being noticed rather
+ * than guessing whether to press something.
+ */
+.step {
   counter-increment: step;
   position: relative;
-  padding-left: 30px;
-  margin-bottom: 18px;
+  padding-left: 28px;
 }
 
-.setup-steps li::before {
+.step::before {
   content: counter(step);
   position: absolute;
   left: 0;
   top: 1px;
-  width: 20px;
-  height: 20px;
-  line-height: 20px;
+  width: 18px;
+  height: 18px;
+  line-height: 17px;
   text-align: center;
-  font-size: 0.8em;
+  font-size: 0.75em;
   border-radius: 50%;
-  color: var(--vscode-badge-foreground);
-  background: var(--vscode-badge-background);
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-descriptionForeground);
 }
 
-.setup-steps strong {
+.step[data-state="active"]::before {
+  border-color: var(--vscode-focusBorder);
+  color: var(--vscode-foreground);
+  animation: step-pulse 1.6s ease-in-out infinite;
+}
+
+.step[data-state="done"]::before {
+  content: "\2713";
+  border-color: transparent;
+  color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.step[data-state="failed"]::before {
+  content: "!";
+  border-color: var(--vscode-inputValidation-errorBorder, #f14c4c);
+  color: var(--vscode-inputValidation-errorBorder, #f14c4c);
+}
+
+@keyframes step-pulse {
+  50% {
+    opacity: 0.4;
+  }
+}
+
+.step strong {
   display: block;
+  font-weight: 600;
   margin-bottom: 2px;
 }
 
-.setup-steps p {
+.step p {
   margin: 0 0 8px;
   font-size: 0.9em;
   color: var(--vscode-descriptionForeground);
 }
 
+/* A finished step keeps its place in the list but stops asking for attention. */
+.step[data-state="done"] strong {
+  font-weight: normal;
+  color: var(--vscode-descriptionForeground);
+}
+
+.step[data-state="done"] p {
+  margin-bottom: 0;
+}
+
+.setup-detail {
+  margin: 0 0 16px;
+  padding-left: 28px;
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
+}
+
 .setup .hint {
-  font-size: 0.9em;
+  font-size: 0.85em;
   color: var(--vscode-descriptionForeground);
   margin: 0;
 }
@@ -339,41 +400,31 @@ button:disabled {
   flex: 1 1 auto;
 }
 
-/* --- top bar and usage ------------------------------------------- */
+/* --- usage strip ------------------------------------------------ */
 
-.topbar {
-  flex: 0 0 auto;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-bottom: 1px solid var(--vscode-panel-border);
-}
-
-.topbar .status {
-  flex: 1 1 auto;
-  border-bottom: none;
-}
-
-.linkish {
-  background: none;
-  border: none;
-  padding: 4px 10px;
-  font-size: 0.85em;
-  cursor: pointer;
-  color: var(--vscode-textLink-foreground);
-}
-
-.linkish:hover {
-  background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.15));
-}
-
+/*
+ * The strip is the toggle for the account panel, so it is a real button — and
+ * has to opt out of the global button styling, which would otherwise paint the
+ * whole width of it in the primary colour.
+ */
 .usage-bar {
-  flex: 0 0 auto;
+  width: 100%;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 5px 12px;
+  border: none;
+  border-radius: 0;
   border-bottom: 1px solid var(--vscode-panel-border);
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.usage-bar:hover {
+  background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.12));
 }
 
 .usage-track {
@@ -671,23 +722,32 @@ button:disabled {
 
 /* --- drop zone ----------------------------------------------------- */
 
+/*
+ * The whole panel is the drop area — the handlers sit on window, not on the
+ * message box — so it should look like it. It used to be a small label
+ * floating near the composer, which read as "drop on the box" and was the
+ * reason nobody knew the rest of the panel would take a file.
+ */
 .dropzone {
   position: absolute;
   inset: 0;
   z-index: 30;
   display: flex;
-  align-items: flex-end;
+  align-items: center;
   justify-content: center;
-  padding-bottom: 78px;
   pointer-events: none;
+  border: 2px dashed var(--vscode-focusBorder);
+  border-radius: var(--radius);
+  background: var(--vscode-editor-background);
+  /* Enough to read the label against, while the chat stays visible behind. */
+  opacity: 0.97;
 }
 
 .dropzone span {
-  padding: 14px 22px;
-  border-radius: var(--radius);
-  border: 2px dashed var(--vscode-focusBorder);
+  padding: 0 var(--gap);
+  text-align: center;
+  line-height: 1.6;
   color: var(--vscode-foreground);
-  background: var(--vscode-editor-background);
 }
 
 /* --- drag target -------------------------------------------------- */
@@ -699,4 +759,272 @@ button:disabled {
 .composer.drag-target textarea {
   border-color: var(--vscode-focusBorder);
   border-style: dashed;
+}
+
+/* --- composer locked during setup ---------------------------------- */
+
+.composer-locked {
+  opacity: 0.55;
+}
+
+.composer-locked textarea {
+  cursor: not-allowed;
+}
+
+/* What the panel is doing right now, under what the user is asked to do. */
+.step-note {
+  margin: 0 0 8px;
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.85;
+}
+
+/* --- connecting ---------------------------------------------------- */
+
+/*
+ * Shown in the transcript, not just the status line. A restart used to look
+ * like nothing was happening right up until a setup screen appeared.
+ */
+.connecting {
+  margin: auto 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.9em;
+}
+
+.spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 1.5px solid var(--vscode-panel-border);
+  border-top-color: var(--vscode-focusBorder);
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Respect the system setting rather than spinning regardless. */
+@media (prefers-reduced-motion: reduce) {
+  .spinner {
+    animation-duration: 2.4s;
+  }
+}
+
+/* --- a start that failed for some other reason ---------------------- */
+
+.setup-error {
+  margin: 0 0 16px;
+  padding: 8px 11px;
+  border-radius: var(--radius);
+  border-left: 3px solid var(--vscode-inputValidation-errorBorder, #f14c4c);
+  background: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.08));
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: 0.85em;
+  white-space: pre-wrap;
+}
+
+.setup-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+/* --- image previews ------------------------------------------------ */
+
+/*
+ * Attachments used to be filenames. A screenshot is far easier to recognise
+ * as a picture, so the chip and the sent message both show one.
+ */
+.thumb {
+  display: block;
+  max-width: 100%;
+  border-radius: 3px;
+  object-fit: cover;
+}
+
+.chip-image .thumb {
+  width: 22px;
+  height: 22px;
+  margin-right: 6px;
+}
+
+.chip-image .chip-open {
+  display: flex;
+  align-items: center;
+  padding-left: 4px;
+}
+
+.msg-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.msg-images .thumb {
+  max-width: 160px;
+  max-height: 120px;
+  width: auto;
+  height: auto;
+  border: 1px solid var(--vscode-panel-border);
+}
+
+/* --- past chats ----------------------------------------------------- */
+
+.history {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.history-bar {
+  margin-bottom: 10px;
+}
+
+.linkish {
+  padding: 2px 0;
+  border: none;
+  background: none;
+  font: inherit;
+  font-size: 0.85em;
+  cursor: pointer;
+  color: var(--vscode-textLink-foreground);
+}
+
+.history-empty {
+  margin: 0;
+  font-size: 0.9em;
+  line-height: 1.5;
+  color: var(--vscode-descriptionForeground);
+}
+
+.history-day {
+  margin: 14px 0 4px;
+  font-size: 0.72em;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.8;
+}
+
+.history-day:first-of-type {
+  margin-top: 0;
+}
+
+.history-row {
+  display: flex;
+  align-items: center;
+  border-radius: 3px;
+}
+
+.history-row:hover {
+  background: var(--vscode-list-hoverBackground);
+}
+
+/* The chat you are already in, so reopening it is obviously a no-op. */
+.history-row.current {
+  background: var(--vscode-list-activeSelectionBackground);
+  color: var(--vscode-list-activeSelectionForeground);
+}
+
+.history-open {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 7px 9px;
+  border: none;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.history-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.history-meta {
+  margin-top: 2px;
+  font-size: 0.8em;
+  opacity: 0.7;
+}
+
+.history-delete {
+  flex: 0 0 auto;
+  margin-right: 5px;
+}
+
+/* --- account usage panel -------------------------------------------- */
+
+/* Anchors the dropdown to the strip rather than to the page. */
+.usage-wrap {
+  position: relative;
+  flex: 0 0 auto;
+}
+
+.usage-panel {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  z-index: 25;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--vscode-panel-border);
+  background: var(--vscode-dropdown-background, var(--vscode-editor-background));
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.35);
+}
+
+.usage-body {
+  margin: 0 0 8px;
+  font-size: 0.85em;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  color: var(--vscode-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.usage-body.bad {
+  color: var(--vscode-errorForeground, #f14c4c);
+}
+
+.usage-loading {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.usage-refresh {
+  padding: 2px 10px;
+  font-size: 0.85em;
+}
+
+/* --- the file you are looking at ------------------------------------ */
+
+/*
+ * Quieter than an attachment you chose yourself: it appears on its own, so it
+ * should read as context rather than as something you did.
+ */
+.chip-active {
+  gap: 6px;
+  padding: 2px 4px 2px 8px;
+  background: transparent;
+  border: 1px solid var(--vscode-panel-border);
+  color: var(--vscode-descriptionForeground);
+}
+
+.chip-active-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

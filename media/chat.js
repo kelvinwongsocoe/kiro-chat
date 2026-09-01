@@ -16,10 +16,10 @@
   const modelBtn = el("model-btn");
   const modelLabel = el("model-label");
   const modelMenu = el("model-menu");
-  const usageBtn = el("usage-btn");
   const usageBar = el("usage-bar");
   const usageFill = el("usage-fill");
   const usageText = el("usage-text");
+  const usagePanel = el("usage-panel");
   const dropzone = el("dropzone");
 
   let current = null;
@@ -29,10 +29,15 @@
   let attachments = [];
   let selection = null;
   let includeSelection = true;
+  /** The file the editor is showing, sent with the message like Copilot does. */
+  let activeFile = null;
+  let includeActiveFile = true;
   let canSendImages = false;
   let busy = false;
   let usage = {};
-  let usageNote = null;
+  /** The last account report, so reopening the panel does not refetch. */
+  let usageReport = null;
+  let usageLoading = false;
 
   // VS Code destroys and rebuilds this script whenever the view is moved
   // between the sidebar, the panel or the secondary sidebar. Anything we
@@ -45,6 +50,14 @@
       vscode.setState({ history: history.slice(-MAX_HISTORY), includeSelection });
     } catch (err) {
       // State is a convenience. Never let it break the panel.
+    }
+    // Webview state dies with the panel, so hand the same transcript to the
+    // extension, which can keep it in the chat history. This fires per turn,
+    // not per chunk, so it is not chatty.
+    try {
+      vscode.postMessage({ type: "transcript", history: history.slice(-MAX_HISTORY) });
+    } catch (err) {
+      // Same again: never let bookkeeping break the chat.
     }
   }
 
@@ -187,11 +200,23 @@
     return node;
   }
 
+  /**
+   * Both roles run the full width of the one column, so the label above the
+   * text is the only thing telling them apart.
+   */
+  function roleLabel(who) {
+    const label = document.createElement("div");
+    label.className = "msg-role";
+    label.textContent = who;
+    return label;
+  }
+
   function addUserBubble(message) {
     clearEmptyState();
     const was = atBottom();
     const node = document.createElement("div");
     node.className = "msg user";
+    node.appendChild(roleLabel("You"));
 
     if (message.text) {
       const body = document.createElement("div");
@@ -199,8 +224,19 @@
       node.appendChild(body);
     }
 
+    // Pictures are shown; everything else is named.
+    const shown = (message.attachments || []).filter((a) => a.preview);
+    if (shown.length) {
+      const strip = document.createElement("div");
+      strip.className = "msg-images";
+      for (const a of shown) strip.appendChild(thumbnail(a));
+      node.appendChild(strip);
+    }
+
     const tags = [];
-    for (const a of message.attachments || []) tags.push(`${iconFor(a.kind)} ${a.label}`);
+    for (const a of message.attachments || []) {
+      if (!a.preview) tags.push(`${iconFor(a.kind)} ${a.label}`);
+    }
     if (message.selection) tags.push(`\u2317 ${message.selection}`);
 
     if (tags.length) {
@@ -219,6 +255,7 @@
     clearEmptyState();
     const root = document.createElement("div");
     root.className = "msg agent";
+    root.appendChild(roleLabel("Kiro"));
     const tools = document.createElement("div");
     tools.className = "tools";
     const body = document.createElement("div");
@@ -410,6 +447,70 @@
   // Usage
   // ---------------------------------------------------------------
 
+  // ---------------------------------------------------------------
+  // Account usage panel
+  //
+  // This used to be posted into the conversation as note bubbles, which shoved
+  // the chat around and — going through recordSimple — saved the report into
+  // the chat history as though the user had asked for it there. It is a panel
+  // now: open it, read it, close it, and the transcript never knows.
+  // ---------------------------------------------------------------
+
+  function renderUsagePanel() {
+    usagePanel.innerHTML = "";
+
+    if (usageLoading) {
+      const wait = document.createElement("div");
+      wait.className = "usage-loading";
+      const spinner = document.createElement("span");
+      spinner.className = "spinner";
+      const label = document.createElement("span");
+      label.textContent = "Asking Kiro for your usage…";
+      wait.appendChild(spinner);
+      wait.appendChild(label);
+      usagePanel.appendChild(wait);
+      return;
+    }
+
+    const body = document.createElement("div");
+    body.className = usageReport && usageReport.ok === false ? "usage-body bad" : "usage-body";
+    body.textContent = usageReport
+      ? usageReport.text
+      : "No account usage fetched yet.";
+    usagePanel.appendChild(body);
+
+    const refresh = document.createElement("button");
+    refresh.type = "button";
+    refresh.className = "ghost usage-refresh";
+    refresh.textContent = usageReport ? "Refresh" : "Check account usage";
+    refresh.addEventListener("click", () => {
+      usageLoading = true;
+      renderUsagePanel();
+      vscode.postMessage({ type: "refreshUsage" });
+    });
+    usagePanel.appendChild(refresh);
+  }
+
+  function setUsagePanel(open) {
+    usagePanel.hidden = !open;
+    usageBar.setAttribute("aria-expanded", open ? "true" : "false");
+    if (open) renderUsagePanel();
+  }
+
+  function toggleUsagePanel() {
+    const opening = usagePanel.hidden;
+    closeMenus();
+    setUsagePanel(opening);
+    // Nothing to read yet, so go and get it rather than showing an empty box.
+    if (opening && !usageReport && !usageLoading) {
+      usageLoading = true;
+      renderUsagePanel();
+      vscode.postMessage({ type: "refreshUsage" });
+    }
+  }
+
+  usageBar.addEventListener("click", toggleUsagePanel);
+
   function renderUsage(next) {
     usage = next || {};
     const parts = [];
@@ -441,8 +542,6 @@
       : "";
   }
 
-  usageBtn.addEventListener("click", () => vscode.postMessage({ type: "refreshUsage" }));
-
   // ---------------------------------------------------------------
   // Attachment chips
   // ---------------------------------------------------------------
@@ -453,8 +552,77 @@
     return "\u{1F4C4}";
   }
 
+  /**
+   * An image attachment shows the picture, not its filename. The extension
+   * sends a data URI, which the page's CSP allows; anything too big to be
+   * worth sending arrives without one and falls back to the text chip.
+   */
+  function thumbnail(attachment) {
+    if (!attachment.preview) return null;
+    const img = document.createElement("img");
+    img.className = "thumb";
+    img.src = attachment.preview;
+    img.alt = attachment.label;
+    img.title = attachment.label;
+    return img;
+  }
+
+  /**
+   * Windows writes the same file several ways — drive-letter case, either
+   * slash, a trailing separator. Comparing the raw strings would show the same
+   * file as two chips. Mirrors samePath() in src/paths.ts, which is what the
+   * extension uses to drop the duplicate before sending.
+   */
+  function samePathish(a, b) {
+    if (!a || !b) return false;
+    const tidy = (p) => String(p).replace(/\\/g, "/").replace(/\/+$/, "").toLowerCase();
+    return tidy(a) === tidy(b);
+  }
+
   function renderChips() {
     chipsEl.innerHTML = "";
+
+    // Already attached by hand, or dragged in? Then the file you are looking
+    // at is the same file, and showing it twice is noise — the extension
+    // drops the duplicate before sending, so the chip would be lying anyway.
+    const activeAlreadyAttached =
+      activeFile && attachments.some((a) => samePathish(a.path, activeFile.path));
+
+    // The file on screen comes first: it is the broadest bit of context, and
+    // the selection chip below narrows it down.
+    if (activeFile && includeActiveFile && !activeAlreadyAttached) {
+      const chip = document.createElement("span");
+      chip.className = "chip chip-active";
+      chip.title = "Kiro can open " + activeFile.label + ". Click × to leave it out.";
+
+      const label = document.createElement("span");
+      label.className = "chip-active-label";
+      label.textContent = "◎ " + activeFile.label;
+      chip.appendChild(label);
+
+      const off = document.createElement("button");
+      off.type = "button";
+      off.className = "chip-x";
+      off.textContent = "×";
+      off.title = "Do not send this file";
+      off.addEventListener("click", () => {
+        includeActiveFile = false;
+        renderChips();
+      });
+      chip.appendChild(off);
+
+      chipsEl.appendChild(chip);
+    } else if (activeFile && !includeActiveFile && !activeAlreadyAttached) {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip chip-muted";
+      chip.textContent = "◎ add " + activeFile.label;
+      chip.addEventListener("click", () => {
+        includeActiveFile = true;
+        renderChips();
+      });
+      chipsEl.appendChild(chip);
+    }
 
     if (selection && selection.hasSelection && includeSelection) {
       const chip = document.createElement("span");
@@ -501,7 +669,16 @@
       const open = document.createElement("button");
       open.type = "button";
       open.className = "chip-open";
-      open.textContent = `${iconFor(a.kind)} ${a.label}`;
+      const thumb = thumbnail(a);
+      if (thumb) {
+        chip.classList.add("chip-image");
+        open.appendChild(thumb);
+        const name = document.createElement("span");
+        name.textContent = a.label;
+        open.appendChild(name);
+      } else {
+        open.textContent = `${iconFor(a.kind)} ${a.label}`;
+      }
       open.title = a.path || a.label;
       if (a.path) {
         open.addEventListener("click", () =>
@@ -550,10 +727,16 @@
     if (!modelBtn.contains(event.target) && !modelMenu.contains(event.target)) {
       setMenu(modelMenu, modelBtn, false);
     }
+    if (!usageBar.contains(event.target) && !usagePanel.contains(event.target)) {
+      setUsagePanel(false);
+    }
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") closeMenus();
+    if (event.key === "Escape") {
+      closeMenus();
+      setUsagePanel(false);
+    }
   });
 
   // ---------------------------------------------------------------
@@ -625,39 +808,80 @@
     const dt = event.dataTransfer;
     if (!dt) return;
 
-    // VS Code's Explorer offers dragged items as a uri-list.
-    const uriList = dt.getData("text/uri-list") || dt.getData("resourceurls") || "";
-    let uris = uriList
-      .split(/\r?\n/)
-      .map((line) => line.trim())
-      .filter((line) => line && !line.startsWith("#"));
-
-    // resourceurls arrives as a JSON array of encoded strings.
-    if (uris.length === 1 && uris[0].startsWith("[")) {
+    // VS Code offers the same drag under several names at once, and which
+    // ones are filled in varies by where the drag came from. Read them all
+    // and let the extension work out what was meant; picking one format is
+    // how a drop ends up looking as though it did nothing.
+    const values = [];
+    for (const format of DROP_FORMATS) {
       try {
-        uris = JSON.parse(uris[0]).map((u) => decodeURIComponent(String(u)));
+        const value = dt.getData(format);
+        if (value) values.push(value);
       } catch (err) {
-        // Leave the single entry as-is.
+        // Some formats throw rather than return empty. Skip them.
       }
     }
 
-    if (uris.length === 0) {
-      const plain = dt.getData("text/plain").trim();
-      if (plain) uris = [plain];
+    // A drag from outside VS Code — Windows Explorer, a browser — carries
+    // real files instead. Images can be attached from their contents; other
+    // files only if the host exposes a path.
+    const files = dt.files ? Array.from(dt.files) : [];
+    for (const file of files) {
+      if (file.path) values.push(file.path);
     }
+    const images = files.filter((f) => !f.path && /^image\//.test(f.type));
+    for (const image of images) attachDroppedImage(image);
 
-    if (uris.length > 0) vscode.postMessage({ type: "dropped", uris });
+    // Always report, even with nothing usable: the types that were on offer
+    // are the only way to tell a drop that was not understood from one that
+    // never arrived. Kiro Chat: Show Log has it.
+    vscode.postMessage({
+      type: "dropped",
+      values,
+      types: dt.types ? Array.from(dt.types) : [],
+      fileCount: files.length,
+    });
   });
+
+  /** Formats VS Code and the OS use for a dragged file, most specific first. */
+  const DROP_FORMATS = [
+    "text/uri-list",
+    "resourceurls",
+    "codefiles",
+    "application/vnd.code.uri-list",
+    "text/plain",
+  ];
+
+  /** A picture dragged in from outside VS Code, which has no path to attach. */
+  function attachDroppedImage(file) {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const result = String(reader.result || "");
+      const comma = result.indexOf(",");
+      if (comma === -1) return;
+      vscode.postMessage({
+        type: "pastedImage",
+        name: file.name || "dropped image",
+        mimeType: file.type || "image/png",
+        data: result.slice(comma + 1),
+      });
+    };
+    reader.readAsDataURL(file);
+  }
 
   // ---------------------------------------------------------------
   // Sending
   // ---------------------------------------------------------------
 
-  function setBusy(value) {
-    busy = value;
-    sendBtn.disabled = value;
-    stopBtn.hidden = !value;
-    modelBtn.disabled = value;
+  function setBusy(status) {
+    busy = status === "busy" || status === "starting";
+    // Setup outranks this: a "ready" status arriving mid-setup must not hand
+    // the user a live Send button pointing at a Kiro that is not there.
+    sendBtn.disabled = busy || setup !== null;
+    // Only a reply can be stopped. Offering Stop while Kiro is merely
+    // starting up points at a turn that does not exist.
+    stopBtn.hidden = status !== "busy";
+    modelBtn.disabled = busy;
   }
 
   /** Put "@src/app.ts" into the message at the caret, so the text refers to it. */
@@ -689,7 +913,7 @@
     if (!text && attachments.length === 0) return;
     inputEl.value = "";
     resize();
-    vscode.postMessage({ type: "send", text, includeSelection });
+    vscode.postMessage({ type: "send", text, includeSelection, includeActiveFile });
   }
 
   formEl.addEventListener("submit", (event) => {
@@ -710,74 +934,263 @@
 
   // ---------------------------------------------------------------
   // First-run setup screen
+  //
+  // This screen drives itself. The extension watches for kiro-cli appearing
+  // and reports progress through setupState messages; each step shows where
+  // it has got to, and once Kiro connects the screen gets out of the way.
   // ---------------------------------------------------------------
 
-  function stepRow(title, detail, buttonLabel, action) {
+  // null when the panel is a normal chat.
+  let setup = null;
+
+  const SETUP_STEPS = [
+    {
+      id: "install",
+      title: "Install Kiro",
+      detail:
+        "Opens PowerShell with the install command typed in. Press Enter to run it — nothing runs on its own.",
+      action: "installKiro",
+      button: "Install Kiro",
+    },
+    {
+      id: "signin",
+      title: "Sign in",
+      detail: "Opens PowerShell with the login command. It sends you to your browser.",
+      action: "signIn",
+      button: "Sign in",
+    },
+    {
+      id: "connect",
+      title: "Start chatting",
+      detail: "Happens by itself once the two steps above are done.",
+      action: "retry",
+      button: "Connect now",
+    },
+  ];
+
+  /** What each watcher state means for each step. */
+  const SETUP_PROGRESS = {
+    looking: { install: "active", note: "Waiting for kiro-cli to appear…" },
+    found: { install: "done", note: null },
+    connecting: { install: "done", signin: "active", note: "Connecting to Kiro…" },
+    "needs-signin": { install: "done", signin: "todo", note: null },
+    connected: { install: "done", signin: "done", connect: "done", note: null },
+    "gave-up": { note: null },
+  };
+
+  /**
+   * `why` says what the box is waiting for. Getting this wrong is how a
+   * reconnect ends up telling the user to finish an install they finished
+   * days ago.
+   */
+  function setComposerEnabled(on, why) {
+    inputEl.disabled = !on;
+    sendBtn.disabled = !on;
+    attachBtn.disabled = !on;
+    formEl.classList.toggle("composer-locked", !on);
+    inputEl.placeholder = on
+      ? "Ask Kiro…"
+      : why || "Finish setting Kiro up to start chatting";
+  }
+
+  function stepNode(step, state, note, primary) {
     const li = document.createElement("li");
-    const h = document.createElement("strong");
-    h.textContent = title;
-    const p = document.createElement("p");
-    p.textContent = detail;
-    const b = document.createElement("button");
-    b.type = "button";
-    b.textContent = buttonLabel;
-    b.dataset.act = action;
-    li.appendChild(h);
-    li.appendChild(p);
-    li.appendChild(b);
+    li.className = "step";
+    li.dataset.state = state;
+
+    const title = document.createElement("strong");
+    title.textContent = step.title;
+    li.appendChild(title);
+
+    const detail = document.createElement("p");
+    detail.textContent = step.detail;
+    li.appendChild(detail);
+
+    // What the panel is doing right now, under what the user is asked to do.
+    if (note) {
+      const progress = document.createElement("p");
+      progress.className = "step-note";
+      progress.textContent = note;
+      li.appendChild(progress);
+    }
+
+    // A finished step keeps its explanation but loses its button; there is
+    // nothing left to press. The last step runs itself, so it only offers a
+    // button once waiting has actually failed.
+    const useless = state === "done" || (step.id === "connect" && state !== "failed");
+    if (!useless) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.dataset.act = step.action;
+      button.textContent = step.button;
+      // Exactly one loud button: the thing to do next. Anything else the user
+      // could press is there, but quiet, so the eye lands on the right one.
+      if (!primary) button.classList.add("ghost");
+      li.appendChild(button);
+    }
+
     return li;
   }
 
-  function showSetup(reason) {
+  /**
+   * Kiro is installed and was working, but this start failed for a reason
+   * that is not the login. Say what broke and offer Try again first — the
+   * numbered install steps have nothing to do with this.
+   */
+  function renderFailure(wrap) {
+    const heading = document.createElement("h2");
+    heading.textContent = "Kiro wouldn't start";
+    wrap.appendChild(heading);
+
+    const lead = document.createElement("p");
+    lead.textContent =
+      "It was working a moment ago, so this is probably temporary. Trying again usually sorts it.";
+    wrap.appendChild(lead);
+
+    if (setup.error) {
+      const why = document.createElement("p");
+      why.className = "setup-error";
+      why.textContent = setup.error;
+      wrap.appendChild(why);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "setup-actions";
+
+    const again = document.createElement("button");
+    again.type = "button";
+    again.dataset.act = "retry";
+    again.textContent = "Try again";
+    actions.appendChild(again);
+
+    // Still offered, but demoted: being signed out is only one of the ways
+    // this can happen, and it is not the likely one after a restart.
+    const signIn = document.createElement("button");
+    signIn.type = "button";
+    signIn.className = "ghost";
+    signIn.dataset.act = "signIn";
+    signIn.textContent = "Sign in";
+    actions.appendChild(signIn);
+
+    wrap.appendChild(actions);
+  }
+
+  function renderSetup() {
+    if (!setup) return;
+    setComposerEnabled(
+      false,
+      setup.reason === "failed"
+        ? "Kiro isn't connected"
+        : "Finish setting Kiro up to start chatting"
+    );
     messagesEl.innerHTML = "";
     current = null;
     buffer = "";
 
-    const missing = reason === "missing";
+    if (setup.reason === "failed") {
+      const wrap = document.createElement("div");
+      wrap.className = "setup";
+      renderFailure(wrap);
+
+      const footer = document.createElement("p");
+      footer.className = "hint";
+      const log = document.createElement("a");
+      log.href = "#";
+      log.dataset.act = "showLog";
+      log.textContent = "See the full log";
+      footer.appendChild(log);
+      footer.appendChild(document.createTextNode(" for what was tried."));
+      wrap.appendChild(footer);
+
+      wrap.addEventListener("click", (event) => {
+        const target = event.target.closest("[data-act]");
+        if (!target) return;
+        event.preventDefault();
+        vscode.postMessage({ type: target.dataset.act });
+      });
+
+      messagesEl.appendChild(wrap);
+      return;
+    }
+
+    const missing = setup.reason === "missing";
+    const progress = SETUP_PROGRESS[setup.state] || {};
+
     const wrap = document.createElement("div");
     wrap.className = "setup";
-    wrap.innerHTML =
-      "<h2>" +
-      escapeHtml(missing ? "One more thing to install" : "Almost there") +
-      "</h2><p>" +
-      escapeHtml(
-        missing
-          ? "Kiro's command line tool is not on this machine yet. That is the part this panel talks to."
-          : "Kiro is installed but would not start. Nearly always this means you are not signed in yet."
-      ) +
-      "</p>";
 
-    const steps = document.createElement("ol");
-    steps.className = "setup-steps";
+    const heading = document.createElement("h2");
+    heading.textContent = missing ? "Let's get Kiro installed" : "Almost there";
+    wrap.appendChild(heading);
 
-    if (missing) {
-      steps.appendChild(
-        stepRow(
-          "Install Kiro",
-          "Opens PowerShell and types the install command. Press Enter to run it.",
-          "Install Kiro",
-          "installKiro"
-        )
-      );
+    const lead = document.createElement("p");
+    lead.textContent = missing
+      ? "Kiro's command line tool isn't on this machine yet. That's the part this panel talks to."
+      : "Kiro is installed but wouldn't start. Nearly always that means you're not signed in yet.";
+    wrap.appendChild(lead);
+
+    const list = document.createElement("ol");
+    list.className = "setup-steps";
+
+    let primaryTaken = false;
+    for (const step of SETUP_STEPS) {
+      // Nothing to install when the binary is already there.
+      if (step.id === "install" && !missing) continue;
+
+      let state = progress[step.id] || "todo";
+      if (setup.state === "gave-up") state = "failed";
+
+      let note = state === "active" ? progress.note : null;
+      if (step.id === "install" && state === "done" && setup.foundAt) {
+        note = "Found at " + setup.foundAt;
+      }
+      if (step.id === "signin" && setup.error && state !== "done") {
+        note = "Kiro would not start: " + setup.error;
+      }
+
+      // The first unfinished step is the one to shout about.
+      const primary = !primaryTaken && state !== "done";
+      if (primary) primaryTaken = true;
+
+      list.appendChild(stepNode(step, state, note, primary));
     }
-    steps.appendChild(
-      stepRow(
-        "Sign in",
-        "Opens PowerShell with the login command. It will send you to your browser.",
-        "Sign in",
-        "signIn"
-      )
-    );
-    steps.appendChild(
-      stepRow("Come back here", "Once that finishes, connect.", "Connect", "retry")
-    );
-    wrap.appendChild(steps);
+
+    wrap.appendChild(list);
+
+    // Watching has a time limit, so say so rather than looking like it is
+    // still working when it has quietly stopped.
+    if (setup.state === "gave-up") {
+      const detail = document.createElement("p");
+      detail.className = "setup-detail";
+      detail.textContent =
+        "Stopped watching for Kiro. Press Connect once it is installed and you are signed in.";
+      wrap.appendChild(detail);
+    }
 
     const footer = document.createElement("p");
     footer.className = "hint";
-    footer.innerHTML =
-      'Still stuck? <a href="#" data-act="showLog">See what was tried</a> or ' +
-      '<a href="#" data-act="openSettings">set the path yourself</a>.';
+    const copy = document.createElement("a");
+    copy.href = "#";
+    copy.dataset.act = "copyCommand";
+    copy.textContent = "Copy the install command";
+    const log = document.createElement("a");
+    log.href = "#";
+    log.dataset.act = "showLog";
+    log.textContent = "see what was tried";
+    const settings = document.createElement("a");
+    settings.href = "#";
+    settings.dataset.act = "openSettings";
+    settings.textContent = "set the path yourself";
+
+    footer.appendChild(document.createTextNode("Rather do it yourself? "));
+    if (missing) {
+      footer.appendChild(copy);
+      footer.appendChild(document.createTextNode(", "));
+    }
+    footer.appendChild(log);
+    footer.appendChild(document.createTextNode(" or "));
+    footer.appendChild(settings);
+    footer.appendChild(document.createTextNode("."));
     wrap.appendChild(footer);
 
     wrap.addEventListener("click", (event) => {
@@ -788,6 +1201,199 @@
     });
 
     messagesEl.appendChild(wrap);
+  }
+
+  function showSetup(reason, detail) {
+    setup = {
+      reason,
+      state: reason === "missing" ? "looking" : "needs-signin",
+      note: null,
+      error: reason === "missing" ? null : detail,
+    };
+    renderSetup();
+  }
+
+  /**
+   * Kiro is starting. Show it in the transcript rather than only in the status
+   * line, so a restart looks like it is working instead of looking like
+   * nothing is happening until a screen appears.
+   */
+  function showConnecting() {
+    if (setup) return; // the setup screen has more to say than a spinner
+    setComposerEnabled(false, "Connecting to Kiro…");
+    messagesEl.innerHTML = "";
+    current = null;
+    buffer = "";
+
+    const wrap = document.createElement("div");
+    wrap.className = "connecting";
+    const spinner = document.createElement("span");
+    spinner.className = "spinner";
+    const label = document.createElement("span");
+    label.textContent = "Connecting to Kiro…";
+    wrap.appendChild(spinner);
+    wrap.appendChild(label);
+    messagesEl.appendChild(wrap);
+  }
+
+  function clearConnecting() {
+    const node = messagesEl.querySelector(".connecting");
+    if (node) node.remove();
+    if (!setup) setComposerEnabled(true);
+  }
+
+  /**
+   * Put the setup screen away and hand the panel back to the chat. Called for
+   * the watcher's own "connected", and for any other route that gets Kiro
+   * running — pressing Connect, or a restart from the title bar — because
+   * those never send a setup message at all.
+   */
+  function leaveSetup() {
+    if (!setup) return;
+    setup = null;
+    setComposerEnabled(true);
+    messagesEl.innerHTML = "";
+    messagesEl.appendChild(emptyState());
+  }
+
+  /** Progress from the watcher. "connected" hands the panel back to the chat. */
+  function updateSetup(state, detail) {
+    if (!setup) return;
+    if (state === "connected") {
+      leaveSetup();
+      return;
+    }
+    setup.state = state;
+    // Where it was found stays on screen for the rest of setup: it is the
+    // proof that the install worked, and the answer to "did it even see it?".
+    if (state === "found") setup.foundAt = detail;
+    // Why it would not start. Worth showing — "not signed in" is only the
+    // usual cause, not the only one.
+    if (state === "needs-signin") setup.error = detail;
+    renderSetup();
+  }
+
+  // ---------------------------------------------------------------
+  // Past chats
+  //
+  // The list takes over the transcript area rather than opening a dialog, so
+  // it works wherever the panel is docked. Nothing is thrown away to show it:
+  // going back puts the conversation straight back on screen.
+  // ---------------------------------------------------------------
+
+  // Two separate things: the list the extension last sent, and whether it is
+  // on screen. Folding them into one variable meant going back to the chat
+  // threw the list away, so reopening it showed "no past chats".
+  let historyData = null;
+  let historyOpen = false;
+
+  function renderHistory() {
+    if (!historyOpen) return;
+    const view = historyData || { groups: [] };
+    messagesEl.innerHTML = "";
+    current = null;
+
+    const wrap = document.createElement("div");
+    wrap.className = "history";
+
+    const bar = document.createElement("div");
+    bar.className = "history-bar";
+    const back = document.createElement("button");
+    back.type = "button";
+    back.className = "linkish";
+    back.dataset.act = "back";
+    back.textContent = "‹ Back to chat";
+    bar.appendChild(back);
+    wrap.appendChild(bar);
+
+    const groups = view.groups || [];
+    if (groups.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent =
+        "No past chats in this folder yet. They are saved as you talk.";
+      wrap.appendChild(empty);
+    }
+
+    for (const group of groups) {
+      const heading = document.createElement("div");
+      heading.className = "history-day";
+      heading.textContent = group.label;
+      wrap.appendChild(heading);
+
+      for (const chat of group.chats) {
+        const row = document.createElement("div");
+        row.className = "history-row";
+        if (chat.id === view.openId) row.classList.add("current");
+
+        const open = document.createElement("button");
+        open.type = "button";
+        open.className = "history-open";
+        open.dataset.act = "open";
+        open.dataset.id = chat.id;
+
+        const title = document.createElement("div");
+        title.className = "history-title";
+        title.textContent = chat.title;
+        open.appendChild(title);
+
+        const meta = document.createElement("div");
+        meta.className = "history-meta";
+        const count = chat.messageCount === 1 ? "1 message" : chat.messageCount + " messages";
+        meta.textContent = count + " · " + chat.at;
+        // A chat Kiro cannot reopen can still be read, so say which it is
+        // rather than letting the user find out by trying to reply.
+        if (!chat.resumable || !view.canResume) {
+          meta.textContent += " · read only";
+        }
+        open.appendChild(meta);
+
+        row.appendChild(open);
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "chip-x history-delete";
+        remove.dataset.act = "delete";
+        remove.dataset.id = chat.id;
+        remove.textContent = "×";
+        remove.title = "Forget this chat";
+        row.appendChild(remove);
+
+        wrap.appendChild(row);
+      }
+    }
+
+    wrap.addEventListener("click", (event) => {
+      const target = event.target.closest("[data-act]");
+      if (!target) return;
+      event.preventDefault();
+      const act = target.dataset.act;
+      if (act === "back") {
+        closeHistory();
+      } else if (act === "open") {
+        vscode.postMessage({ type: "openChat", id: target.dataset.id });
+      } else if (act === "delete") {
+        vscode.postMessage({ type: "deleteChat", id: target.dataset.id });
+      }
+    });
+
+    messagesEl.appendChild(wrap);
+  }
+
+  function openHistory() {
+    if (setup) return; // setup has more to say than an empty list
+    historyOpen = true;
+    setComposerEnabled(false, "Pick a chat, or go back");
+    renderHistory();
+  }
+
+  /** Put the conversation back exactly as it was. */
+  function closeHistory() {
+    historyOpen = false;
+    setComposerEnabled(true);
+    messagesEl.innerHTML = "";
+    if (history.length > 0) restoreHistory(history);
+    else messagesEl.appendChild(emptyState());
   }
 
   // ---------------------------------------------------------------
@@ -807,7 +1413,14 @@
       case "status":
         statusEl.dataset.state = message.status;
         statusEl.textContent = STATUS_TEXT[message.status] || message.status;
-        setBusy(message.status === "busy" || message.status === "starting");
+        // Kiro is up. However that happened, the instructions for getting it
+        // up have nothing left to say.
+        if (message.status === "ready") {
+          leaveSetup();
+          clearConnecting();
+        }
+        if (message.status === "starting") showConnecting();
+        setBusy(message.status);
         break;
 
       case "capabilities":
@@ -823,27 +1436,43 @@
         break;
 
       case "usageReportLoading":
-        finishAgentBubble();
-        if (usageNote) usageNote.remove();
-        usageNote = addBubble("note", "Asking Kiro for your usage\u2026");
+        usageLoading = true;
+        if (!usagePanel.hidden) renderUsagePanel();
         break;
 
-      case "usageReport": {
-        finishAgentBubble();
-        if (usageNote) {
-          usageNote.remove();
-          usageNote = null;
-        }
-        const kind = message.ok ? "note" : "error";
-        addBubble(kind, message.text);
-        recordSimple(kind, message.text);
+      case "usageReport":
+        usageLoading = false;
+        usageReport = { text: message.text, ok: message.ok !== false };
+        // A refresh asked for from the model menu should show its answer.
+        setUsagePanel(true);
+        break;
+
+      case "toggleUsage":
+        toggleUsagePanel();
+        break;
+
+      case "selection": {
+        selection = message.selection || null;
+        if (!selection) includeSelection = true;
+
+        // Switching to a different file brings the chip back. Dismissing it
+        // means "not this one", not "never again".
+        const next = message.activeFile || null;
+        const changed = (next && next.path) !== (activeFile && activeFile.path);
+        activeFile = next;
+        if (changed) includeActiveFile = true;
+
+        renderChips();
         break;
       }
 
-      case "selection":
-        selection = message.selection || null;
-        if (!selection) includeSelection = true;
-        renderChips();
+      case "defaults":
+        // Seeds the highlighted-code toggle from settings, unless a moved
+        // panel already restored the user's own choice.
+        if (typeof message.sendSelection === "boolean" && !restoredChoice) {
+          includeSelection = message.sendSelection;
+          renderChips();
+        }
         break;
 
       case "attachments":
@@ -901,22 +1530,58 @@
         break;
 
       case "needsSetup":
-        showSetup(message.reason);
+        showSetup(message.reason, message.detail);
+        break;
+
+      case "setupState":
+        updateSetup(message.state, message.detail);
         break;
 
       case "cleared":
         messagesEl.innerHTML = "";
-        messagesEl.appendChild(emptyState());
         current = null;
         buffer = "";
         history = [];
-        usageNote = null;
         saveState();
         renderUsage({});
+        // Starting a new session while Kiro is still missing must not throw
+        // away the instructions for installing it.
+        if (setup) renderSetup();
+        else messagesEl.appendChild(emptyState());
         break;
 
       case "insertMentions":
         insertMentions(message.labels || []);
+        break;
+
+      case "history":
+        historyData = message;
+        if (historyOpen) renderHistory();
+        break;
+
+      case "showHistory":
+        openHistory();
+        break;
+
+      case "openChat":
+        // The transcript comes back from the extension's copy, which outlives
+        // this panel. Kiro is told to reload the session separately.
+        historyOpen = false;
+        setComposerEnabled(true);
+        history = message.history || [];
+        current = null;
+        buffer = "";
+        saveState();
+        messagesEl.innerHTML = "";
+        if (history.length > 0) restoreHistory(history);
+        else messagesEl.appendChild(emptyState());
+        break;
+
+      case "chatReadOnly":
+        // Kiro could not take the conversation back, so replying would start
+        // a different one without saying so. Say so instead.
+        setComposerEnabled(false, "This chat can only be read");
+        addBubble("note", message.why + "\n\nStart a new chat with + to keep talking.");
         break;
     }
   });
@@ -932,7 +1597,7 @@
     line.textContent = "Ask Kiro about your code.";
     const hint = document.createElement("p");
     hint.className = "hint";
-    hint.textContent = "Drop files on the box below, paste a screenshot, or just start typing.";
+    hint.textContent = "Enter sends, Shift+Enter starts a new line. Hold Shift and drag files here to attach them, or paste a screenshot.";
     wrap.appendChild(line);
     wrap.appendChild(hint);
     return wrap;
@@ -972,10 +1637,16 @@
     }
   })();
 
+  // True when a moved panel restored the user’s own toggle, so the setting
+  // default must not overwrite it.
+  let restoredChoice = false;
   let restored = false;
   if (Array.isArray(saved.history) && saved.history.length > 0) {
     history = saved.history;
-    if (typeof saved.includeSelection === "boolean") includeSelection = saved.includeSelection;
+    if (typeof saved.includeSelection === "boolean") {
+      includeSelection = saved.includeSelection;
+      restoredChoice = true;
+    }
     restoreHistory(history);
     restored = true;
   }

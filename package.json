@@ -2,7 +2,7 @@
   "name": "kiro-chat",
   "displayName": "Kiro Chat",
   "description": "Chat with the Kiro agent inside VS Code, like Copilot Chat.",
-  "version": "0.4.1",
+  "version": "0.5.4",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -84,6 +84,16 @@
       {
         "command": "kiroChat.moveView",
         "title": "Kiro Chat: Move Panel (sidebar, bottom or right)"
+      },
+      {
+        "command": "kiroChat.showHistory",
+        "title": "Kiro Chat: Past Chats",
+        "icon": "$(history)"
+      },
+      {
+        "command": "kiroChat.askInChat",
+        "title": "Kiro Chat: Ask in VS Code Chat (drag files here)",
+        "icon": "$(comment-discussion)"
       }
     ],
     "menus": {
@@ -102,6 +112,16 @@
           "command": "kiroChat.showUsage",
           "when": "view == kiroChat.view",
           "group": "navigation@0"
+        },
+        {
+          "command": "kiroChat.showHistory",
+          "when": "view == kiroChat.view",
+          "group": "navigation@3"
+        },
+        {
+          "command": "kiroChat.askInChat",
+          "when": "view == kiroChat.view",
+          "group": "navigation@4"
         }
       ],
       "editor/context": [
@@ -127,10 +147,10 @@
     "configuration": {
       "title": "Kiro Chat",
       "properties": {
-        "kiroChat.command": {
-          "type": "string",
-          "default": "",
-          "markdownDescription": "Leave empty and the extension will find `kiro-cli` for you. Only set this if it cannot. Run `which kiro-cli` in a terminal to get the full path."
+        "kiroChat.allowFileWrites": {
+          "type": "boolean",
+          "default": true,
+          "description": "Let Kiro write files in your workspace. Turn this off to make the chat read-only."
         },
         "kiroChat.args": {
           "type": "array",
@@ -140,6 +160,21 @@
           "default": [],
           "markdownDescription": "Extra arguments added before `acp`, for example `[\"--agent\", \"my-agent\"]`."
         },
+        "kiroChat.attachActiveFile": {
+          "type": "boolean",
+          "default": true,
+          "description": "Send the file you are looking at with each message, so Kiro can open it. It shows as a chip above the message box; click the chip to leave it out of one message."
+        },
+        "kiroChat.autoApproveTools": {
+          "type": "boolean",
+          "default": false,
+          "description": "Approve every tool Kiro asks to run without asking you first. Leave this off unless you trust the workspace."
+        },
+        "kiroChat.command": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Leave empty and the extension will find `kiro-cli` for you. Only set this if it cannot. Run `which kiro-cli` in a terminal to get the full path."
+        },
         "kiroChat.env": {
           "type": "object",
           "default": {},
@@ -147,16 +182,6 @@
             "type": "string"
           },
           "description": "Extra environment variables for the Kiro process."
-        },
-        "kiroChat.allowFileWrites": {
-          "type": "boolean",
-          "default": true,
-          "description": "Let Kiro write files in your workspace. Turn this off to make the chat read-only."
-        },
-        "kiroChat.autoApproveTools": {
-          "type": "boolean",
-          "default": false,
-          "description": "Approve every tool Kiro asks to run without asking you first. Leave this off unless you trust the workspace."
         },
         "kiroChat.model": {
           "type": "string",
@@ -169,7 +194,16 @@
           "description": "Send the code you have highlighted along with your message. You can also switch this off per message using the chip above the text box."
         }
       }
-    }
+    },
+    "chatParticipants": [
+      {
+        "id": "kiroChat.participant",
+        "name": "kiro",
+        "fullName": "Kiro",
+        "description": "Ask Kiro about your code",
+        "isSticky": true
+      }
+    ]
   },
   "scripts": {
     "compile": "tsc -p ./",

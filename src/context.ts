@@ -17,6 +17,9 @@ export interface Attachment {
 /** Where the caret is right now, sent along automatically. */
 export interface SelectionContext {
   relativePath: string;
+  /** Full path on disk, so the file itself can be attached. Empty for
+   *  untitled and other documents that are not on disk. */
+  fsPath: string;
   languageId: string;
   startLine: number;
   endLine: number;
@@ -39,6 +42,8 @@ export function readSelection(): SelectionContext | undefined {
 
   return {
     relativePath: vscode.workspace.asRelativePath(editor.document.uri),
+    // Untitled and virtual documents have nothing on disk to attach.
+    fsPath: editor.document.uri.scheme === "file" ? editor.document.uri.fsPath : "",
     languageId: editor.document.languageId,
     startLine: selection.start.line + 1,
     endLine: selection.end.line + 1,

@@ -14,6 +14,34 @@ import {
   readSelection,
   SelectionContext,
 } from "./context";
+import { ActiveFile, attachmentsForMessage } from "./activeFile";
+import { parseDroppedPaths } from "./dropped";
+import { findKiro } from "./findKiro";
+import { SetupWatcher } from "./setupWatcher";
+import {
+  ChatRecord,
+  forWorkspace,
+  groupByDay,
+  HistoryItem,
+  pruneHistory,
+  titleFrom,
+  upsertRecord,
+} from "./history";
+
+/** Past chats are kept here, across windows and restarts. */
+const HISTORY_KEY = "kiroChat.history";
+/** Enough to be useful without turning globalState into a database. */
+const MAX_CHATS = 100;
+/**
+ * Images are handed to the webview as data URIs so they can be previewed.
+ * Past this size the chip stays as text rather than pushing megabytes through
+ * postMessage for something rendered 40 pixels wide.
+ */
+const MAX_PREVIEW_BYTES = 4 * 1024 * 1024;
+
+function freshId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+}
 
 function nonce(): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
@@ -35,10 +63,35 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private selection: SelectionContext | undefined;
   private selectionTimer: NodeJS.Timeout | undefined;
 
+  /** Watches for Kiro appearing and connects, so the user need not click. */
+  private readonly setup: SetupWatcher;
+  /**
+   * True while the setup screen owns the panel. Every failed connection
+   * attempt makes the session fire onNeedsSetup again; without this the
+   * watcher's own progress would be wiped by a fresh setup screen each time.
+   */
+  private setupActive = false;
+
+  /** Our id for the chat on screen, so saving it again replaces it. */
+  private chatId = freshId();
+  /** The transcript, as the webview reports it after each turn. */
+  private transcript: HistoryItem[] = [];
+
   constructor(
     private readonly extensionUri: vscode.Uri,
-    private readonly output: vscode.OutputChannel
+    private readonly output: vscode.OutputChannel,
+    private readonly store: vscode.Memento
   ) {
+    this.setup = new SetupWatcher({
+      probe: async () => {
+        const found = await findKiro(() => undefined);
+        if (!found) return undefined;
+        return found.source === "WSL" ? "inside WSL" : found.command;
+      },
+      connect: () => this.session.ensureReady(),
+      onState: (state, detail) => this.onSetupState(state, detail),
+    });
+
     this.session = new KiroSession(output, {
       onStatus: (status, detail) => this.post({ type: "status", status, detail }),
       onText: (text) => this.post({ type: "chunk", text }),
@@ -46,7 +99,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       onTool: (tool) => this.post({ type: "tool", tool }),
       onTurnEnd: (reason) => this.post({ type: "turnEnd", reason }),
       onError: (message) => this.post({ type: "error", text: message }),
-      onNeedsSetup: (reason) => this.post({ type: "needsSetup", reason }),
+      onNeedsSetup: (reason) => this.onNeedsSetup(reason),
       onModels: (models, currentModelId) =>
         this.post({ type: "models", models, currentModelId }),
       onUsage: (usage) => this.post({ type: "usage", usage }),
@@ -74,7 +127,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           await this.onWebviewReady(Boolean(message.restored));
           break;
         case "send":
-          await this.send(String(message.text ?? ""), Boolean(message.includeSelection));
+          await this.send(
+            String(message.text ?? ""),
+            Boolean(message.includeSelection),
+            message.includeActiveFile !== false
+          );
           break;
         case "stop":
           this.session.cancel();
@@ -99,7 +156,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           );
           break;
         case "dropped":
-          await this.handleDrop(Array.isArray(message.uris) ? message.uris : []);
+          await this.handleDrop(
+            Array.isArray(message.values) ? message.values : [],
+            Array.isArray(message.types) ? message.types : [],
+            Number(message.fileCount ?? 0)
+          );
           break;
         case "removeAttachment":
           this.attachments = this.attachments.filter((a) => a.id !== message.id);
@@ -120,11 +181,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           break;
         case "installKiro":
           this.runInTerminal(this.installCommand());
+          // The terminal is the user's to drive, but the panel can watch for
+          // the binary landing and take it from there.
+          this.setup.start();
           break;
         case "signIn":
           this.runInTerminal("kiro-cli login");
+          this.setup.signIn();
+          break;
+        case "copyCommand":
+          await vscode.env.clipboard.writeText(this.installCommand());
+          vscode.window.showInformationMessage(
+            "Install command copied. Paste it into any PowerShell window."
+          );
           break;
         case "retry":
+          this.setup.stop();
+          this.setupActive = false;
           this.post({ type: "cleared" });
           await this.session.newSession().catch(() => undefined);
           break;
@@ -134,12 +207,199 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         case "showLog":
           this.output.show(true);
           break;
+        case "transcript":
+          // The webview keeps the transcript already; this is it reporting in
+          // after a turn so the same copy can outlive the panel.
+          this.transcript = Array.isArray(message.history) ? message.history : [];
+          this.saveCurrentChat();
+          break;
+        case "requestHistory":
+          this.postHistory();
+          break;
+        case "openChat":
+          await this.openChat(String(message.id ?? ""));
+          break;
+        case "deleteChat":
+          await this.deleteChat(String(message.id ?? ""));
+          break;
       }
     });
 
     view.onDidDispose(() => {
       this.view = undefined;
+      // Nothing left to report progress to, and the poll would outlive the panel.
+      this.setup.stop();
     });
+  }
+
+  // ---- chat history ----------------------------------------------------
+
+  private workspaceCwd(): string {
+    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+  }
+
+  private allChats(): ChatRecord[] {
+    return this.store.get<ChatRecord[]>(HISTORY_KEY, []);
+  }
+
+  /**
+   * Keep the chat on screen. Called after every turn, so reopening VS Code
+   * finds the conversation where it was left rather than gone.
+   *
+   * An empty chat is not worth a row in the list, and a chat with no folder
+   * could never be resumed against the right cwd, so neither is saved.
+   */
+  private saveCurrentChat(): void {
+    if (this.transcript.length === 0) return;
+    const cwd = this.workspaceCwd();
+    if (!cwd) return;
+
+    const record: ChatRecord = {
+      id: this.chatId,
+      sessionId: this.session.currentSessionId,
+      cwd,
+      title: titleFrom(this.transcript),
+      updatedAt: Date.now(),
+      messageCount: this.transcript.length,
+      history: this.transcript,
+    };
+
+    const kept = pruneHistory(upsertRecord(this.allChats(), record), MAX_CHATS);
+    void this.store.update(HISTORY_KEY, kept);
+  }
+
+  /** Send the list the webview draws. Only this folder's chats. */
+  private postHistory(): void {
+    const mine = forWorkspace(this.allChats(), this.workspaceCwd());
+    this.post({
+      type: "history",
+      canResume: this.session.canLoadSessions,
+      openId: this.chatId,
+      groups: groupByDay(mine, Date.now()).map((group) => ({
+        label: group.label,
+        chats: group.records.map((r) => ({
+          id: r.id,
+          title: r.title,
+          messageCount: r.messageCount,
+          at: new Date(r.updatedAt).toLocaleTimeString(undefined, {
+            hour: "numeric",
+            minute: "2-digit",
+          }),
+          resumable: Boolean(r.sessionId),
+        })),
+      })),
+    });
+  }
+
+  /**
+   * Reopen a past chat. The transcript is redrawn from our own copy; Kiro is
+   * asked to load the session so it has the conversation in mind and the user
+   * can carry on. If that fails the transcript is still shown, read-only —
+   * seeing it is more useful than an error.
+   */
+  private async openChat(id: string): Promise<void> {
+    const record = this.allChats().find((r) => r.id === id);
+    if (!record) {
+      vscode.window.showWarningMessage("That chat is no longer stored.");
+      return;
+    }
+
+    // Whatever is on screen now is not lost by opening something else.
+    this.saveCurrentChat();
+
+    this.chatId = record.id;
+    this.transcript = record.history ?? [];
+    this.attachments = [];
+    this.postAttachments();
+    this.post({ type: "openChat", history: this.transcript, title: record.title });
+
+    if (!record.sessionId) {
+      this.post({ type: "chatReadOnly", why: "This chat was never given a Kiro session." });
+      return;
+    }
+
+    try {
+      await this.session.loadSession(record.sessionId);
+      this.everConnected = true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      this.output.appendLine(`Could not reopen chat ${id}: ${message}`);
+      this.post({
+        type: "chatReadOnly",
+        why: `Kiro could not reopen this conversation: ${message}`,
+      });
+    }
+  }
+
+  private async deleteChat(id: string): Promise<void> {
+    const kept = this.allChats().filter((r) => r.id !== id);
+    await this.store.update(HISTORY_KEY, kept);
+    // Deleting the chat you are looking at leaves you in a fresh one.
+    if (id === this.chatId) {
+      this.chatId = freshId();
+      this.transcript = [];
+      this.post({ type: "cleared" });
+    }
+    this.postHistory();
+  }
+
+  showHistory(): void {
+    this.focus();
+    this.postHistory();
+    this.post({ type: "showHistory" });
+  }
+
+  /**
+   * The title bar button. The panel decides whether that means opening or
+   * closing, and asks for a refresh itself if it has nothing to show — one
+   * place owns the toggle rather than two disagreeing about it.
+   */
+  showUsage(): void {
+    this.focus();
+    this.post({ type: "toggleUsage" });
+  }
+
+  // ---- setup screen ----------------------------------------------------
+
+  /**
+   * Kiro could not start. Show the setup screen once and, when the binary is
+   * simply not there yet, start watching for it. Later failures are the
+   * watcher's own retries; they must not restart the screen underneath it.
+   */
+  private onNeedsSetup(reason: "missing" | "signin" | "failed", detail?: string): void {
+    if (this.setupActive) return;
+
+    // Kiro has worked in this window before, so this is a reconnect, not a
+    // first run. Retry quietly behind the loading state: a torn-down client
+    // or a slow spawn fixes itself, and throwing a setup screen at someone
+    // who was chatting seconds ago is how "restart" came to mean "log in
+    // again". Only a real sign-in error skips the retries.
+    if (this.everConnected && reason !== "signin") {
+      this.setup.reconnect();
+      return;
+    }
+
+    this.setupActive = true;
+    this.post({ type: "needsSetup", reason, detail });
+    if (reason === "missing") this.setup.start();
+  }
+
+  private onSetupState(state: string, detail?: string): void {
+    this.output.appendLine(`Setup: ${state}${detail ? ` (${detail})` : ""}`);
+
+    // The quiet retries of a reconnect ran out. Now it is worth interrupting,
+    // and the screen leads with what actually broke rather than the login.
+    if (state === "failed") {
+      this.setupActive = true;
+      this.post({ type: "needsSetup", reason: "failed", detail });
+      return;
+    }
+
+    this.post({ type: "setupState", state, detail });
+    if (state === "connected") {
+      this.setupActive = false;
+      this.everConnected = true;
+    }
   }
 
   /**
@@ -158,6 +418,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     this.post({ type: "capabilities", caps: { image: this.session.canSendImages } });
     this.post({ type: "status", status: this.session.currentStatus });
+    // This setting was declared but never read, so the toggle did nothing.
+    // It seeds whether the highlighted code goes with the first message.
+    this.post({
+      type: "defaults",
+      sendSelection: vscode.workspace
+        .getConfiguration("kiroChat")
+        .get<boolean>("sendSelection", true),
+    });
 
     if (restored) {
       const usage = this.session.getUsage();
@@ -187,6 +455,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     void this.view?.webview.postMessage(message);
   }
 
+  /** The live Kiro session, shared with the @kiro chat participant so both
+   *  boxes talk to one conversation rather than two agents. */
+  get kiroSession(): KiroSession {
+    return this.session;
+  }
+
   focus(): void {
     void vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
   }
@@ -209,6 +483,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               lineCount: this.selection.endLine - this.selection.startLine + 1,
             }
           : undefined,
+        // The file being looked at, shown as its own chip and sent with the
+        // message so Kiro can open it — the way Copilot Chat behaves.
+        activeFile: this.activeFile(),
       });
     };
     if (immediate) {
@@ -216,6 +493,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     } else {
       this.selectionTimer = setTimeout(run, 150);
     }
+  }
+
+  /**
+   * The file the editor is showing, if it is one Kiro could open. Turned off
+   * by `kiroChat.attachActiveFile`, and absent for untitled or virtual
+   * documents, which have nothing on disk to attach.
+   */
+  private activeFile(): ActiveFile | undefined {
+    const on = vscode.workspace
+      .getConfiguration("kiroChat")
+      .get<boolean>("attachActiveFile", true);
+    if (!on) return undefined;
+    if (!this.selection?.fsPath) return undefined;
+    return { path: this.selection.fsPath, label: this.selection.relativePath };
   }
 
   // ---- attachments ----------------------------------------------------
@@ -267,22 +558,63 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
   }
 
-  private async handleDrop(rawUris: unknown[]): Promise<void> {
-    const uris: vscode.Uri[] = [];
-    for (const raw of rawUris) {
-      const text = String(raw ?? "").trim();
-      if (!text) continue;
-      try {
-        uris.push(text.startsWith("file:") ? vscode.Uri.parse(text) : vscode.Uri.file(text));
-      } catch {
-        // Not a path we can use.
+  /**
+   * Something was dropped on the panel. The webview hands over every format
+   * the drag carried, because which ones are filled in depends on where it
+   * came from.
+   *
+   * A drop that yields nothing is logged with the formats that were on offer.
+   * Without that there is no way to tell a drop that was not understood from
+   * one that never reached the panel at all, and the difference decides
+   * whether the fix is here or somewhere else entirely.
+   */
+  private async handleDrop(
+    values: unknown[],
+    types: unknown[] = [],
+    fileCount = 0
+  ): Promise<void> {
+    const paths = parseDroppedPaths(values);
+    this.output.appendLine(
+      `Drop: ${paths.length} path(s) from ${values.length} value(s); ` +
+        `formats offered: [${types.map(String).join(", ")}]; files: ${fileCount}`
+    );
+
+    if (paths.length === 0) {
+      if (fileCount === 0 && types.length === 0) {
+        this.output.appendLine(
+          "The drop carried no data at all. If the panel highlighted as you " +
+            "dragged, the drag reached it but VS Code offered nothing to read."
+        );
       }
+      return;
     }
+
+    const uris = paths.map((p) => vscode.Uri.file(p));
     const added = await attachmentsFromUris(uris);
     await this.addAttachments(added);
     if (added.length > 0) {
       this.post({ type: "insertMentions", labels: added.map((a) => a.label) });
+    } else {
+      this.output.appendLine(
+        `None of the dropped paths could be read: ${paths.join(", ")}`
+      );
     }
+  }
+
+  /**
+   * A data URI the webview can put in an <img>, or undefined to leave the
+   * attachment as a text chip. The page's CSP already allows `data:` images.
+   *
+   * Very large images are skipped: the preview is rendered a few dozen pixels
+   * wide, and pushing megabytes through postMessage to draw a thumbnail is not
+   * a trade worth making.
+   */
+  private previewOf(attachment: Attachment): string | undefined {
+    if (attachment.kind !== "image" || !attachment.data) return undefined;
+    // base64 carries 3 bytes in every 4 characters.
+    const bytes = Math.floor((attachment.data.length * 3) / 4);
+    if (bytes > MAX_PREVIEW_BYTES) return undefined;
+    return `data:${attachment.mimeType ?? "image/png"};base64,${attachment.data}`;
   }
 
   private postAttachments(): void {
@@ -293,6 +625,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         kind: a.kind,
         label: a.label,
         path: a.path,
+        preview: this.previewOf(a),
       })),
     });
   }
@@ -314,17 +647,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   // ---- sending --------------------------------------------------------
 
-  async send(text: string, includeSelection: boolean): Promise<void> {
+  async send(
+    text: string,
+    includeSelection: boolean,
+    includeActiveFile = true
+  ): Promise<void> {
     const trimmed = text.trim();
     if (!trimmed && this.attachments.length === 0) return;
 
     this.selection = readSelection();
-    const attached = [...this.attachments];
+    // The file on screen goes along too, unless the user dismissed its chip.
+    // A file already attached by hand wins, so nothing is sent twice.
+    const attached = attachmentsForMessage(
+      [...this.attachments],
+      this.activeFile(),
+      includeActiveFile
+    ) as Attachment[];
 
     this.post({
       type: "userMessage",
       text: trimmed,
-      attachments: attached.map((a) => ({ kind: a.kind, label: a.label })),
+      // The preview goes with the sent message too, so the transcript shows
+      // the picture you sent rather than its filename.
+      attachments: attached.map((a) => ({
+        kind: a.kind,
+        label: a.label,
+        preview: this.previewOf(a),
+      })),
       selection:
         includeSelection && this.selection?.hasSelection
           ? `${this.selection.relativePath}:${this.selection.startLine}-${this.selection.endLine}`
@@ -351,6 +700,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   async newSession(): Promise<void> {
+    // Keep what is on screen before it is thrown away. This used to lose the
+    // conversation outright.
+    this.saveCurrentChat();
+    this.chatId = freshId();
+    this.transcript = [];
+
     this.attachments = [];
     this.post({ type: "cleared" });
     this.postAttachments();
@@ -365,6 +720,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   dispose(): void {
     if (this.selectionTimer) clearTimeout(this.selectionTimer);
     for (const w of this.watchers) w.dispose();
+    this.setup.stop();
     this.session.dispose();
   }
 
@@ -492,29 +848,31 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 <title>Kiro Chat</title>
 </head>
 <body>
-  <div class="topbar">
-    <div id="status" class="status" data-state="stopped">Not connected</div>
-    <button type="button" id="usage-btn" class="linkish" title="Show credits and context used">Usage</button>
-  </div>
+  <div id="status" class="status" data-state="stopped">Not connected</div>
 
-  <div id="usage-bar" class="usage-bar" hidden>
-    <div class="usage-track"><div id="usage-fill" class="usage-fill"></div></div>
-    <span id="usage-text" class="usage-text"></span>
+  <div class="usage-wrap">
+    <button type="button" id="usage-bar" class="usage-bar" hidden aria-expanded="false"
+      title="Credits and context. Click for your account usage.">
+      <div class="usage-track"><div id="usage-fill" class="usage-fill"></div></div>
+      <span id="usage-text" class="usage-text"></span>
+      <span class="caret">&#9662;</span>
+    </button>
+    <div id="usage-panel" class="usage-panel" hidden></div>
   </div>
 
   <div id="messages" class="messages" role="log" aria-live="polite">
     <div class="empty">
       <p>Ask Kiro about your code.</p>
-      <p class="hint">Drop files on the box below, paste a screenshot, or just start typing.</p>
+      <p class="hint">Enter sends, Shift+Enter starts a new line. Hold Shift and drag files here to attach them, or paste a screenshot.</p>
     </div>
   </div>
 
-  <div id="dropzone" class="dropzone" hidden><span>Drop to add as context</span></div>
+  <div id="dropzone" class="dropzone" hidden><span>Drop anywhere here to attach</span></div>
 
   <form id="composer" class="composer">
     <div id="chips" class="chips" hidden></div>
 
-    <textarea id="input" rows="2" placeholder="Ask Kiro&#8230;  (Enter to send, Shift+Enter for a new line)"></textarea>
+    <textarea id="input" rows="2" placeholder="Ask Kiro&#8230;"></textarea>
 
     <div class="composer-row">
       <div class="attach-wrap">
