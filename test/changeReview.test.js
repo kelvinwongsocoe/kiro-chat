@@ -23,16 +23,23 @@ test("the editor-tab review has obvious whole-file and per-hunk decisions", () =
   assert.match(reviewer, /createTextEditorDecorationType/);
   assert.match(reviewer, /diffEditor\.insertedLineBackground/);
   assert.match(reviewer, /diffEditor\.removedLineBackground/);
-  assert.match(reviewer, /ACCEPT ENTIRE FILE/);
-  assert.match(reviewer, /REJECT ENTIRE FILE/);
-  assert.match(reviewer, /ACCEPT CHANGE/);
-  assert.match(reviewer, /REJECT CHANGE/);
-  assert.match(reviewer, /REVIEW CHANGE/);
-  assert.match(reviewer, /button\.background/);
-  assert.match(reviewer, /button\.foreground/);
-  assert.match(reviewer, /Alt\+Enter/);
-  assert.match(reviewer, /Shift\+Alt\+Enter/);
+  assert.match(reviewer, /"Accept all"/);
+  assert.match(reviewer, /"Reject all"/);
+  assert.match(reviewer, /title: "Accept"/);
+  assert.match(reviewer, /title: "Reject"/);
   assert.match(reviewer, /registerCodeLensProvider/);
+
+  // The numbered badge over every hunk is gone, and the labels carry no icons.
+  assert.doesNotMatch(reviewer, /REVIEW CHANGE/);
+  assert.doesNotMatch(reviewer, /\$\(check\)|\$\(x\)|\$\(check-all\)|\$\(close-all\)/);
+
+  /*
+   * Inlay hints look like buttons — VS Code paints them as chips — but they
+   * only fire through ClickLinkGesture, which requires the trigger modifier.
+   * A plain click does nothing, so they must not be the review's controls.
+   */
+  assert.doesNotMatch(reviewer, /registerInlayHintsProvider/);
+  assert.doesNotMatch(reviewer, /InlayHintLabelPart/);
   assert.match(reviewer, /buildReviewDiff\(request\.before, request\.after, 0\)/);
   assert.match(reviewer, /applySelectedLines/);
 });

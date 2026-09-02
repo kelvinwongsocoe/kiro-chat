@@ -1,5 +1,184 @@
 # Changelog
 
+## 0.14.1
+
+- **The past-chats list is quieter.** The "New chat" button is gone — the title bar
+  already has one, and a second competing with the rows was a duplicate. Deleting a chat
+  no longer asks first; the `×` still stays hidden until you point at the row, so it is
+  never under the cursor of someone aiming at the chat beside it.
+- **The list is restyled.** The open chat was painting as a solid selection block, which
+  repaints its preview line and timestamp in the selection foreground — the greys that
+  make them read as secondary text had nothing to be muted against, so every row was one
+  flat colour. It is now a soft tint with an accent bar down the left. Rows are rounded,
+  hover fades in rather than snapping, the `×` is a proper icon button that turns red
+  under the pointer, and the search box takes a single focus ring.
+
+## 0.14.0
+
+Past chats. Three of these lost or corrupted a chat outright.
+
+- **Reopening a chat no longer binds it to the wrong conversation.** Opening a chat sent
+  its stored transcript to the panel and *then* asked Kiro to load the session. The panel
+  reported that transcript straight back, which beat the load every time, so the chat was
+  re-saved carrying whichever session was still running — the previous chat's. Reopening
+  it after that resumed the wrong conversation. The panel no longer reports back a
+  transcript it was handed, and the session a chat belongs to is pinned before anything
+  can be reported.
+- **Reading a chat no longer moves it to Today.** The same round trip re-saved the record
+  with the current time, so browsing the list quietly reordered it.
+- **Two paths silently overwrote a chat.** "Try again" on the setup screen, and a panel
+  rebuilt with nothing in it, both started a new conversation without putting the old one
+  away or giving the new one its own id — so the new chat was written into the old chat's
+  record and replaced it. All three ways of starting a chat now go through one place.
+- **A long chat no longer renames itself.** Only the last 120 messages are stored, and the
+  title was re-derived from those, so a chat renamed itself the moment its opening message
+  dropped out of the window. A chat now keeps the name it has. Where the older messages
+  really are gone, the chat says so instead of appearing to begin in the middle.
+- **The chat limit is per folder.** One busy project used to evict a quiet one's history.
+- **Saving is debounced.** Every message rewrote every stored chat, transcripts and all.
+
+And the list itself:
+
+- **Chats show their newest line**, because titles repeat — real chats open with "fix
+  this" — and a column of identical rows cannot be read.
+- **A search box** appears once there are more than five.
+- **Deleting asks first.** It was one click, permanent, on rows that can look identical.
+  The `×` also now stays out of the way until you point at the row or tab to it.
+- **Escape leaves the list**, and there is a **New chat** button in it, so getting out
+  does not mean hunting for the button in the title bar.
+- **The keep-or-undo bar is cleared** when you open another chat. It used to stay pinned,
+  offering to undo edits made in a conversation no longer on screen.
+
+## 0.13.1
+
+- **The review tab is named the way git names a diff**: `chat.js (Working Tree)` rather
+  than `Review chat.js`. It follows the convention the editor already teaches instead of
+  inventing one. Naming it this way means the tab no longer ends in the file's extension,
+  so VS Code can no longer work out the language on its own — the review now takes the
+  language from the real file and sets it explicitly, and the diff keeps its syntax
+  highlighting.
+
+## 0.13.0
+
+- **Ctrl+Z now undoes a change you accepted.** Accepted content was written straight to
+  disk, which the editor never sees: the document reloaded with no undo entry, so the
+  change was effectively permanent and the chat's own undo was the only way back. Accepted
+  content now goes through VS Code's own edit, so it lands on the file's undo stack like
+  any edit you made yourself. Putting a file back after a rejection stays a plain disk
+  write — that has to be exact, and saving it would run format-on-save.
+- **The review tab is named apart from the file.** It was labelled exactly like the real
+  file, so two identical-looking tabs sat side by side and it was easy to start typing in
+  the wrong one. It now reads `Review chat.js`, keeping the extension so syntax
+  highlighting still works.
+- **Format-on-save no longer breaks a review.** Saving an accepted change runs your
+  formatter, so what lands on disk is not byte for byte what was accepted. That looked
+  like somebody else editing the file mid-review: every decision after the first was
+  refused, and the review never finished. It now reads the file back and believes it.
+
+## 0.12.1
+
+- **A file you answered in the diff is no longer asked about again.** Deciding every hunk
+  and then being asked "keep all changes or undo?" is the same question twice, and the
+  second one cannot be answered without contradicting the first. The keep-or-undo card now
+  only covers changes that never went through a review — where it is the only gate there
+  is. This is the same one-gate rule that already stops an edit being approved before the
+  diff is shown.
+- **Walking the changes works like resolving a merge conflict.** Clicking the
+  "Reviewing … — 2 changes left" line takes you to a change; clicking it again takes you to
+  the next. The separate **Next change** button is gone — it was a third control competing
+  with the two decisions next to it. `Alt+F5` / `Shift+Alt+F5` in the review editor and the
+  links at the top of the diff are unchanged.
+
+## 0.12.0
+
+- **The keep-or-reject card is back.** The webview half of it had gone missing from
+  `media/chat.js`, so the extension announced every open review and finished turn into
+  nothing: no card appeared above the message box, and the only way to answer an edit was
+  to find the diff tab yourself. The card is restored, and there are now tests that fail
+  if the webview stops listening for `reviewActive` or `turnChanges`.
+- **You can jump between the proposed changes.** A file with several edits meant scrolling
+  and hunting for the next coloured line. There is now a **Next change** button on the card
+  in the chat, **Next change** / **Previous change** links at the top of the diff, and
+  `Alt+F5` / `Shift+Alt+F5` in the review editor. The walk wraps round at either end and
+  only visits changes still waiting for a decision, so it empties out as you work through
+  them.
+
+## 0.11.3
+
+- **Fixes the review getting stuck part-way through.** Accepting a change writes it to
+  disk, which takes a moment, and a second click arriving before that finished was thrown
+  away silently. The count stopped going down, the button appeared to do nothing, and
+  because the last decision never registered the review never finished — leaving the chat
+  bar reporting changes that were no longer there. Decisions now wait their turn instead
+  of being discarded.
+
+## 0.11.2
+
+- **Fixes the inline diff not appearing at all.** The extension predicted what each of
+  Kiro's edits should produce and abandoned the review unless the file matched that
+  prediction exactly. The prediction drifts for entirely ordinary reasons — several edits
+  to one file, or a replace it models differently from Kiro — and when it drifted you got
+  "no longer matches Kiro's proposed edit, so it was left untouched" **and Kiro's edit
+  stayed on disk unreviewed**, which is the one outcome the review exists to prevent. The
+  review now always shows what is actually on disk against the file as it was before the
+  turn. A mismatch is noted in the log instead of cancelling anything.
+- **Closing the review tab no longer throws away changes you already accepted.** Accepting
+  a hunk writes it immediately, but closing the tab afterwards rewrote the original over
+  the whole file, silently undoing it. Closing now keeps every hunk you accepted and drops
+  only the ones you never decided. Cancelling the turn still discards everything, since
+  the whole run is being abandoned.
+
+## 0.11.1
+
+- **The keep-or-undo controls now sit just above the message box** instead of in the
+  conversation, so they stay put while you scroll and while you read the diff in another tab.
+- **They appear the moment the inline diff opens**, not after the turn finishes. You can
+  decide each change in the diff, or take **Keep all changes** / **Reject all changes** from
+  the chat without walking through every hunk. The bar counts down as you decide.
+- Once the review is done it becomes the after-the-turn summary, listing what changed with
+  **Undo all changes** still available.
+
+## 0.11.0
+
+- **The chat now asks whether to keep everything a turn changed.** When Kiro finishes
+  editing, a card appears with **Keep all changes** and **Undo all changes**, listing the
+  files it touched and marking each as created, changed or deleted. Undo puts every one of
+  them back exactly as it was before the turn.
+- The card only counts files that really changed. A review you rejected, or a file Kiro
+  rewrote with what it already contained, is not offered — there would be nothing to undo.
+- Undo disables itself while it runs, so it cannot be fired twice, and a new turn replaces
+  the card instead of stacking another.
+
+## 0.10.3
+
+- **Fixes Accept and Reject doing nothing in 0.10.2.** Those buttons were drawn as inlay
+  hints, which VS Code paints as chips but only makes clickable while a modifier key is
+  held — so an ordinary click was ignored. They are ordinary clickable actions again,
+  still labelled just **Accept** and **Reject** with no icons, and **Accept all** /
+  **Reject all** at the top of the file.
+- The numbered badge over every hunk stays gone.
+
+## 0.10.2
+
+- **The "Review change N of M" badge over every hunk is gone.** The Accept and Reject
+  controls already say what the block is for.
+- **Per-hunk actions are now buttons, labelled just Accept and Reject.** They were plain
+  text links with icons and a numbered scope. They are drawn as chips at the end of the
+  changed line, using VS Code's inlay hint styling, and respond to an ordinary click.
+- Whole-file actions at the top are now **Accept all** and **Reject all**, without icons.
+
+## 0.10.1
+
+- **An edit now asks you once, at the moment you can answer.** Kiro editing a file used to
+  need two approvals: a permission card asking "may I write this file?", and then the
+  review diff asking "keep these changes?". The first was asked before there was anything
+  to look at, so there was no way to answer it properly. Kiro now makes the edit and the
+  diff is the only gate — the first thing you see is what actually changed.
+- The permission card still appears whenever no diff is coming: with
+  `kiroChat.reviewFileWrites` off, `kiroChat.allowFileWrites` off, or in the read-only
+  **Plan** workflow. In those cases it is the only gate there is.
+- Tools that are not edits are unaffected and still ask first.
+
 ## 0.10.0
 
 - Review hunks now carry a theme-aware blue **Review change N of M** badge, and the

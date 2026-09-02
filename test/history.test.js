@@ -6,6 +6,8 @@ const assert = require("node:assert/strict");
 
 const {
   titleFrom,
+  stableTitle,
+  previewOf,
   groupByDay,
   forWorkspace,
   pruneHistory,
@@ -51,6 +53,64 @@ test("a message that is only attachments is named by them", () => {
     { role: "user", text: "", attachments: [{ kind: "image", label: "screenshot.png" }] },
   ]);
   assert.equal(title, "screenshot.png");
+});
+
+// ---- a name a chat keeps ---------------------------------------------
+
+/*
+ * Only the tail of a long chat is stored, so re-deriving the name from the
+ * saved transcript renames it the moment the opening message drops out of the
+ * window. The row in the list changes under the user for no reason they can
+ * see, and there is no way to get the old name back.
+ */
+test("a chat that already has a name keeps it when the opening message is gone", () => {
+  const trimmed = [
+    { role: "user", text: "and now make it green" },
+    { role: "agent", text: "Done." },
+  ];
+  assert.equal(stableTitle("Fix the setup screen", trimmed), "Fix the setup screen");
+});
+
+test("a chat still called New chat is allowed to find a real name", () => {
+  const history = [{ role: "user", text: "Why is the usage strip blank?" }];
+  assert.equal(stableTitle("New chat", history), "Why is the usage strip blank?");
+  assert.equal(stableTitle(undefined, history), "Why is the usage strip blank?");
+  assert.equal(stableTitle("   ", history), "Why is the usage strip blank?");
+});
+
+test("a chat with nothing to name it by is still New chat", () => {
+  assert.equal(stableTitle(undefined, []), "New chat");
+});
+
+// ---- telling two chats apart -----------------------------------------
+
+/*
+ * Real chats open with whatever was on the user's mind — "fix this", "change
+ * null to true" — so the titles repeat and a column of identical rows cannot
+ * be read. The newest line is what actually distinguishes them.
+ */
+test("a chat is previewed by its newest line", () => {
+  const preview = previewOf([
+    { role: "user", text: "change null to true" },
+    { role: "agent", text: "Changed it." },
+    { role: "user", text: "now revert that" },
+  ]);
+  assert.equal(preview, "now revert that");
+});
+
+test("a message with no text is skipped rather than previewed as blank", () => {
+  const preview = previewOf([
+    { role: "user", text: "change null to true" },
+    { role: "agent", text: "", tools: [{ title: "Editing chat.js", status: "completed" }] },
+  ]);
+  assert.equal(preview, "change null to true");
+});
+
+test("a long preview is cut, and an empty chat previews as nothing", () => {
+  const preview = previewOf([{ role: "user", text: "b".repeat(300) }]);
+  assert.ok(preview.length <= 90, `preview was ${preview.length} chars`);
+  assert.match(preview, /…$/);
+  assert.equal(previewOf([]), "");
 });
 
 // ---- grouping by day -------------------------------------------------
@@ -154,6 +214,37 @@ test("only the newest chats are kept", () => {
 test("pruning a short list leaves it alone", () => {
   const records = [{ id: "a", updatedAt: 1 }];
   assert.deepEqual(pruneHistory(records, 10).map((r) => r.id), ["a"]);
+});
+
+/*
+ * The list only ever shows one folder's chats, so a global cap means a busy
+ * project silently evicts a quiet one's history — the user loses chats from a
+ * repo they have not opened in a week because of work done somewhere else.
+ */
+test("the cap is per folder, so one project cannot evict another's chats", () => {
+  const records = [
+    { id: "busy-1", cwd: "C:\\busy", updatedAt: 500 },
+    { id: "busy-2", cwd: "C:\\busy", updatedAt: 400 },
+    { id: "busy-3", cwd: "C:\\busy", updatedAt: 300 },
+    { id: "quiet-1", cwd: "C:\\quiet", updatedAt: 10 },
+    { id: "quiet-2", cwd: "C:\\quiet", updatedAt: 5 },
+  ];
+  const kept = pruneHistory(records, 2).map((r) => r.id);
+  assert.deepEqual(kept.filter((id) => id.startsWith("busy")), ["busy-1", "busy-2"]);
+  assert.deepEqual(
+    kept.filter((id) => id.startsWith("quiet")),
+    ["quiet-1", "quiet-2"],
+    "the quiet project's chats must survive the busy one"
+  );
+});
+
+test("the same folder spelled two ways counts once against the cap", () => {
+  const records = [
+    { id: "a", cwd: "C:\\kiro-chat", updatedAt: 3 },
+    { id: "b", cwd: "c:/kiro-chat/", updatedAt: 2 },
+    { id: "c", cwd: "C:/KIRO-CHAT", updatedAt: 1 },
+  ];
+  assert.deepEqual(pruneHistory(records, 2).map((r) => r.id), ["a", "b"]);
 });
 
 // ---- saving a chat ---------------------------------------------------

@@ -62,6 +62,15 @@ function fakeVscode(options = {}) {
       asRelativePath: (p) => String(p),
     },
     Uri: { joinPath: (...parts) => ({ fsPath: parts.join("/") }), file: (p) => ({ fsPath: p }) },
+    // ChangeReviewer creates one as a field, so constructing KiroSession
+    // now touches this immediately rather than lazily.
+    EventEmitter: class {
+      constructor() {
+        this.event = () => ({ dispose() {} });
+      }
+      fire() {}
+      dispose() {}
+    },
     ThemeIcon: class { constructor(id) { this.id = id; } },
     TreeItem: class { constructor(label) { this.label = label; } },
     ConfigurationTarget: { Global: 1 },

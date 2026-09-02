@@ -10,6 +10,7 @@ const root = path.join(__dirname, "..");
 const css = fs.readFileSync(path.join(root, "media", "chat.css"), "utf8");
 const js = fs.readFileSync(path.join(root, "media", "chat.js"), "utf8");
 const provider = fs.readFileSync(path.join(root, "src", "chatViewProvider.ts"), "utf8");
+const reviewer = fs.readFileSync(path.join(root, "src", "changeReviewer.ts"), "utf8");
 
 test("chat.js is valid JavaScript", () => {
   assert.doesNotThrow(() => new vm.Script(js, { filename: "chat.js" }));
@@ -238,7 +239,7 @@ test("an oversized image falls back to a text chip", () => {
  * read-only.
  */
 test("past chats are stored with what is needed to reopen them", () => {
-  assert.match(provider, /sessionId: this\.session\.currentSessionId/);
+  assert.match(provider, /sessionId: this\.chatSessionId \?\? this\.session\.currentSessionId/);
   assert.match(provider, /HISTORY_KEY/, "history has to be stored somewhere durable");
   assert.match(js, /case "openChat"/, "the webview must react to a chat being opened");
 });
@@ -246,14 +247,182 @@ test("past chats are stored with what is needed to reopen them", () => {
 /**
  * Starting a new chat used to throw the old one away. Now it is archived
  * first, which is the only reason history has anything in it.
+ *
+ * Three paths begin a chat — the + button, Try again on the setup screen, and
+ * a panel rebuilt with nothing in it. Two of them used to skip the archiving
+ * and the id rotation, so the conversation that followed was written into the
+ * previous chat's record and upsert replaced it. They all go through one
+ * helper now, and this checks none of them has drifted back out.
  */
 test("starting a new chat keeps the old one", () => {
-  const fresh = provider.slice(provider.indexOf("async newSession()"));
+  const fresh = provider.slice(provider.indexOf("private beginFreshChat()"));
+  const body = fresh.slice(0, 500);
+  assert.match(body, /saveCurrentChat\(\)/, "the outgoing chat must be saved");
+  assert.match(body, /this\.chatId = freshId\(\)/, "and the new one must get its own id");
+  assert.match(body, /this\.transcript = \[\]/, "and start with an empty transcript");
+
+  for (const [name, start] of [
+    ["the + button", "async newSession()"],
+    ["Try again on the setup screen", 'case "retry"'],
+    ["a panel rebuilt blank", "if (this.everConnected) {"],
+  ]) {
+    const region = provider.slice(provider.indexOf(start));
+    assert.match(
+      region.slice(0, 500),
+      /beginFreshChat\(\)/,
+      `${name} must archive the chat it is replacing`
+    );
+  }
+});
+
+/*
+ * Reading a past chat must not rewrite it.
+ *
+ * `openChat` posts the stored transcript down and only then awaits
+ * `session/load`. The webview used to save its state — which reports the
+ * transcript back — the instant it received it, and that round trip beats a
+ * 30-second ACP request every time. So the record was re-saved while the load
+ * was still in flight: its timestamp jumped to now, so a chat from last week
+ * moved to Today merely for being opened, and its session id was overwritten
+ * with whichever session was still running, which was the *previous* chat's.
+ * Reopening it after that resumed the wrong conversation.
+ */
+test("opening a past chat does not report its transcript back", () => {
+  const handler = js.slice(js.indexOf('case "openChat":'));
+  const body = handler.slice(0, handler.indexOf("case \"chatReadOnly\""));
   assert.match(
-    fresh.slice(0, 400),
-    /saveCurrentChat\(\)/,
-    "the outgoing chat must be saved before it is cleared"
+    body,
+    /saveState\(false\)/,
+    "a transcript handed to us by the extension must not be sent back"
   );
+  assert.doesNotMatch(
+    body,
+    /saveState\(\)/,
+    "reporting it would re-save the record we were just given"
+  );
+  assert.match(
+    js,
+    /function saveState\(report\)/,
+    "saveState has to be able to persist locally without reporting"
+  );
+
+  // And the provider pins the chat's own session before anything can report.
+  const open = provider.slice(provider.indexOf("private async openChat("));
+  const pin = open.indexOf("this.chatSessionId = record.sessionId");
+  const post = open.search(/this\.post\(\{\s*type: "openChat"/);
+  assert.ok(pin >= 0, "openChat must pin the session the record belongs to");
+  assert.ok(post >= 0, "openChat must tell the webview about the chat");
+  assert.ok(pin < post, "it must be pinned before the webview is told, not after");
+});
+
+/*
+ * The keep-or-undo bar belongs to the turn that raised it. Opening a different
+ * chat used to leave it pinned above the composer, offering to undo edits made
+ * in a conversation that is no longer on screen.
+ */
+test("opening a past chat clears the other chat's pending changes", () => {
+  const handler = js.slice(js.indexOf('case "openChat":'));
+  const body = handler.slice(0, handler.indexOf("case \"chatReadOnly\""));
+  assert.match(body, /pendingReview = null/);
+  assert.match(body, /pendingChanges = null/);
+  assert.match(body, /renderChangeBar\(\)/);
+});
+
+/*
+ * Only the tail of a long chat is stored. Restoring it silently would show a
+ * conversation that appears to begin in the middle.
+ */
+test("a chat stored as only its tail says so", () => {
+  assert.match(js, /historyTruncated = message\.truncated === true/, "on open");
+  assert.match(js, /truncated: historyTruncated/, "and when reporting back");
+  const restore = js.slice(js.indexOf("function restoreHistory(saved)"));
+  assert.match(
+    restore.slice(0, 600),
+    /if \(historyTruncated\)[\s\S]*history-trimmed/,
+    "a trimmed transcript must say so where it is drawn"
+  );
+  assert.match(css, /^\.history-trimmed \{/m, "the note needs a rule");
+  assert.match(provider, /truncated: this\.transcriptTruncated/, "and it must be stored");
+});
+
+/*
+ * Every save serialises every chat, and the records hold whole transcripts.
+ * Reading and writing the memento per message moved megabytes a turn.
+ */
+test("saving a chat is debounced, and reads the list at write time", () => {
+  assert.match(provider, /private scheduleFlush\(\): void/);
+  const flush = provider.slice(provider.indexOf("private flushChats(): void"));
+  const body = flush.slice(0, flush.indexOf("\n  }"));
+  // Holding the whole list in memory instead would let a second VS Code
+  // window's saves be overwritten by this one's stale copy.
+  assert.match(
+    body,
+    /upsertRecord\(this\.allChats\(\), record\)/,
+    "the stored list must be re-read when the pending chat is written"
+  );
+  assert.doesNotMatch(provider, /private chats: ChatRecord\[\]/, "and never cached");
+
+  const dispose = provider.slice(provider.indexOf("dispose(): void {"));
+  assert.match(
+    dispose.slice(0, 300),
+    /flushChats\(\)/,
+    "a debounced save must not be lost to the window closing"
+  );
+  // A list that leaves out the chat you are in reads as a bug.
+  const list = provider.slice(provider.indexOf("private postHistory(): void"));
+  assert.match(list.slice(0, 400), /flushChats\(\)/);
+});
+
+/*
+ * The list's own affordances. Starting a chat is deliberately NOT one of them:
+ * the title bar already has that button, and a second one in the list is a
+ * duplicate control competing with the rows.
+ */
+test("the past-chats list can be searched and escaped", () => {
+  assert.match(js, /type: "requestHistory"/, "the list must ask for current data");
+  assert.match(provider, /case "requestHistory"/, "and the provider must answer");
+  assert.match(js, /history-search/, "a list of repeated titles needs a filter");
+
+  const escape = js.slice(js.indexOf('if (event.key !== "Escape") return;'));
+  assert.match(
+    escape.slice(0, 400),
+    /closeHistory\(\)/,
+    "Escape must leave the list, like every other overlay in the editor"
+  );
+
+  assert.match(js, /history-preview/, "identical titles need the newest line to tell them apart");
+  assert.match(provider, /preview: previewOf\(/, "which the provider has to send");
+  assert.match(css, /^\.history-preview \{/m);
+  assert.match(css, /^\.history-search \{/m);
+
+  // Deleting is one click. The × keeps out of the way until the row is
+  // pointed at, so it is never under the cursor of someone aiming at the
+  // chat beside it — and `visibility`, so the row does not resize on hover.
+  assert.match(js, /act === "delete"/);
+  assert.doesNotMatch(js, /confirmDelete/, "deleting was asked for direct, with no prompt");
+  assert.doesNotMatch(js, /type: "newChat"/, "the title bar owns starting a chat");
+  assert.doesNotMatch(provider, /case "newChat"/, "so the provider must not carry a dead case");
+  const remove = css.slice(css.indexOf(".history-delete {"));
+  assert.match(remove.slice(0, 500), /visibility: hidden/);
+});
+
+/*
+ * The open chat used to paint as a solid selection block, which repaints the
+ * preview and the timestamp in the selection foreground — the muted greys
+ * that make them read as secondary have nothing to be muted against there.
+ * A tint plus an accent bar keeps the row's own hierarchy.
+ */
+test("the row styling is a tint and an accent, not a solid block", () => {
+  const current = css.slice(css.indexOf(".history-row.current {"));
+  assert.doesNotMatch(
+    current.slice(0, 200),
+    /list-activeSelectionBackground/,
+    "the solid selection block flattens the row's secondary text"
+  );
+  assert.match(css, /^\.history-row\.current::before \{/m, "the accent bar");
+  // Hover and the delete button move, so they need a transition or they snap.
+  const row = css.slice(css.indexOf(".history-row {"));
+  assert.match(row.slice(0, 300), /transition:/);
 });
 
 /**
@@ -427,4 +596,74 @@ test("neither form of the active-file chip duplicates an attachment", () => {
   const body = render.slice(0, 2600);
   const guards = body.match(/!activeAlreadyAttached/g) ?? [];
   assert.equal(guards.length, 2, "both the live and the muted chip need the guard");
+});
+
+
+
+
+/**
+ * Keep-or-undo lives above the message box, not in the transcript.
+ *
+ * It appears the moment the inline diff opens, so both routes are open at
+ * once: decide each hunk in the diff, or take the whole file from here. Inside
+ * the transcript it would scroll away exactly when it is needed, and it has to
+ * stay put while the user reads the diff in another tab.
+ */
+test("keep or undo is pinned above the composer, outside the transcript", () => {
+  assert.match(provider, /id="change-bar"/, "the bar needs its own element");
+  // Before #chips, so it sits between the transcript and the message box.
+  const bar = provider.indexOf('id="change-bar"');
+  const chips = provider.indexOf('id="chips"');
+  const messages = provider.indexOf('id="messages"');
+  assert.ok(bar > messages && bar < chips, "the bar belongs between the transcript and the chips");
+
+  assert.match(css, /^\.change-bar \{/m, "the bar needs a style");
+  assert.doesNotMatch(js, /messagesEl\.appendChild\(card\)/, "it must not go in the transcript");
+});
+
+/** It shows while the diff is open, not only after the turn has finished. */
+test("the bar appears as soon as the review opens", () => {
+  assert.match(provider, /onReviewActive/, "the provider must hear about an open review");
+  assert.match(js, /case "reviewActive"/, "and the webview must show it");
+  assert.match(
+    reviewer,
+    /onDidChangeActiveReview/,
+    "the reviewer must announce when a review is on screen"
+  );
+});
+
+/*
+ * Every message the provider posts about changes needs a handler here.
+ *
+ * The webview half of the bar went missing once. Nothing failed loudly: the
+ * extension went on announcing reviews and finished turns into a switch that
+ * ignored them, so no card ever appeared and the only way to answer an edit
+ * was to hunt down the diff tab. A posted message with no case is silent.
+ */
+test("the webview handles every change message the provider posts", () => {
+  for (const type of ["reviewActive", "turnChanges", "changesUndone"]) {
+    assert.match(
+      provider,
+      new RegExp(`type: "${type}"`),
+      `the provider posts ${type}`
+    );
+    assert.match(js, new RegExp(`case "${type}"`), `so the webview must handle ${type}`);
+  }
+  assert.match(js, /function renderChangeBar\(/, "the bar has to be drawn somewhere");
+});
+
+/** From the bar, Keep and Reject drive the open review rather than the turn. */
+test("the bar drives the open review when there is one", () => {
+  assert.match(provider, /acceptActiveReview\(\)/);
+  assert.match(provider, /rejectActiveReview\(\)/);
+  assert.match(reviewer, /async acceptActive\(\)/);
+  assert.match(reviewer, /async rejectActive\(\)/);
+});
+
+/** Clicking either twice would act on decisions already consumed. */
+test("the bar's buttons cannot be fired twice", () => {
+  const render = js.slice(js.indexOf("function renderChangeBar"));
+  const body = render.slice(0, 2600);
+  assert.match(body, /keep\.disabled = true/);
+  assert.match(body, /undo\.disabled = true/);
 });

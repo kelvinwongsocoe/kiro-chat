@@ -23,8 +23,9 @@ import {
   forWorkspace,
   groupByDay,
   HistoryItem,
+  previewOf,
   pruneHistory,
-  titleFrom,
+  stableTitle,
   upsertRecord,
 } from "./history";
 import { applyChatMode, chatMode } from "./chatModes";
@@ -79,8 +80,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   /** Our id for the chat on screen, so saving it again replaces it. */
   private chatId = freshId();
+  /**
+   * Kiro's session for the chat on screen, when it is a reopened one.
+   * Undefined means "this chat owns whatever session is live", which is the
+   * case for every new chat.
+   */
+  private chatSessionId: string | undefined;
   /** The transcript, as the webview reports it after each turn. */
   private transcript: HistoryItem[] = [];
+  /** True when the webview could only send us the tail of a longer chat. */
+  private transcriptTruncated = false;
+  /** The chat waiting to be written, held back so a turn is one write. */
+  private pendingChat: ChatRecord | undefined;
+  private flushTimer: NodeJS.Timeout | undefined;
 
   constructor(
     private readonly extensionUri: vscode.Uri,
@@ -110,6 +122,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       onUsage: (usage) => this.post({ type: "usage", usage }),
       onCapabilities: (caps) => this.post({ type: "capabilities", caps }),
       onPermission: (request) => this.requestPermissionInChat(request),
+      onReviewActive: (info) => this.post({ type: "reviewActive", review: info }),
+      onTurnChanges: (summary) => this.post({ type: "turnChanges", ...summary }),
     });
 
     // Track where the user is working, so the chip stays current.
@@ -206,6 +220,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         case "retry":
           this.setup.stop();
           this.setupActive = false;
+          // A fresh connection is a fresh chat. Without this the conversation
+          // that follows was written into the previous chat's record, which
+          // upsert then replaced — the old chat vanished with no delete.
+          this.beginFreshChat();
           this.post({ type: "cleared" });
           await this.session.newSession().catch(() => undefined);
           break;
@@ -227,8 +245,24 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           // The webview keeps the transcript already; this is it reporting in
           // after a turn so the same copy can outlive the panel.
           this.transcript = Array.isArray(message.history) ? message.history : [];
+          this.transcriptTruncated = message.truncated === true;
           this.saveCurrentChat();
           break;
+        case "keepChanges":
+          // A review on screen is the live thing to answer; once it has
+          // settled, the same button just stops offering the undo.
+          await this.session.acceptActiveReview();
+          this.session.keepLastTurn();
+          break;
+        case "gotoChange":
+          await this.session.gotoNextChange();
+          break;
+        case "undoChanges": {
+          await this.session.rejectActiveReview();
+          const restored = await this.session.undoLastTurn();
+          this.post({ type: "changesUndone", restored });
+          break;
+        }
         case "requestHistory":
           this.postHistory();
           break;
@@ -260,6 +294,33 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   /**
+   * Write the pending chat out. Debounced, because `saveCurrentChat` runs on
+   * every message and each write serialises every chat we hold — the records
+   * carry whole transcripts, so a turn was moving megabytes several times.
+   *
+   * Only the one chat is held back, and the list it joins is read at write
+   * time. Caching the list instead would let a second VS Code window's saves
+   * be overwritten by this one's stale copy.
+   */
+  private scheduleFlush(): void {
+    if (this.flushTimer) return;
+    this.flushTimer = setTimeout(() => this.flushChats(), 500);
+  }
+
+  /** Write immediately — before anything that must not be lost. */
+  private flushChats(): void {
+    if (this.flushTimer) {
+      clearTimeout(this.flushTimer);
+      this.flushTimer = undefined;
+    }
+    const record = this.pendingChat;
+    if (!record) return;
+    this.pendingChat = undefined;
+    const kept = pruneHistory(upsertRecord(this.allChats(), record), MAX_CHATS);
+    void this.store.update(HISTORY_KEY, kept);
+  }
+
+  /**
    * Keep the chat on screen. Called after every turn, so reopening VS Code
    * finds the conversation where it was left rather than gone.
    *
@@ -271,22 +332,46 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const cwd = this.workspaceCwd();
     if (!cwd) return;
 
+    const existing =
+      this.pendingChat?.id === this.chatId
+        ? this.pendingChat
+        : this.allChats().find((r) => r.id === this.chatId);
     const record: ChatRecord = {
       id: this.chatId,
-      sessionId: this.session.currentSessionId,
+      // `chatSessionId` is set when a past chat is reopened, and stays set
+      // until a new chat begins. Reading the live session here instead let a
+      // transcript arriving while `session/load` was still in flight stamp the
+      // *previous* chat's session onto this record — after which reopening it
+      // resumed the wrong conversation.
+      sessionId: this.chatSessionId ?? this.session.currentSessionId,
       cwd,
-      title: titleFrom(this.transcript),
+      title: stableTitle(existing?.title, this.transcript),
       updatedAt: Date.now(),
       messageCount: this.transcript.length,
       history: this.transcript,
+      truncated: this.transcriptTruncated,
     };
 
-    const kept = pruneHistory(upsertRecord(this.allChats(), record), MAX_CHATS);
-    void this.store.update(HISTORY_KEY, kept);
+    this.pendingChat = record;
+    this.scheduleFlush();
+  }
+
+  /** Put the chat on screen away and begin a fresh one. */
+  private beginFreshChat(): void {
+    this.saveCurrentChat();
+    this.flushChats();
+    this.chatId = freshId();
+    // Undefined means "whatever session is live is this chat's".
+    this.chatSessionId = undefined;
+    this.transcript = [];
+    this.transcriptTruncated = false;
   }
 
   /** Send the list the webview draws. Only this folder's chats. */
   private postHistory(): void {
+    // The chat on screen may still be waiting on the debounce, and a list
+    // that leaves out the conversation you are in reads as a bug.
+    this.flushChats();
     const mine = forWorkspace(this.allChats(), this.workspaceCwd());
     this.post({
       type: "history",
@@ -297,6 +382,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         chats: group.records.map((r) => ({
           id: r.id,
           title: r.title,
+          // Titles repeat — real chats open with "fix this" — so the newest
+          // line is what actually tells two rows apart.
+          preview: previewOf(r.history ?? []),
           messageCount: r.messageCount,
           at: new Date(r.updatedAt).toLocaleTimeString(undefined, {
             hour: "numeric",
@@ -323,12 +411,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
     // Whatever is on screen now is not lost by opening something else.
     this.saveCurrentChat();
+    this.flushChats();
 
     this.chatId = record.id;
+    // Pin the session this chat belongs to before anything can report a
+    // transcript back, so reading a chat cannot rebind it to another one.
+    this.chatSessionId = record.sessionId;
     this.transcript = record.history ?? [];
+    this.transcriptTruncated = record.truncated === true;
     this.attachments = [];
     this.postAttachments();
-    this.post({ type: "openChat", history: this.transcript, title: record.title });
+    this.post({
+      type: "openChat",
+      history: this.transcript,
+      title: record.title,
+      truncated: this.transcriptTruncated,
+    });
 
     if (!record.sessionId) {
       this.post({ type: "chatReadOnly", why: "This chat was never given a Kiro session." });
@@ -349,12 +447,19 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   private async deleteChat(id: string): Promise<void> {
-    const kept = this.allChats().filter((r) => r.id !== id);
-    await this.store.update(HISTORY_KEY, kept);
+    // A save still waiting on the debounce would put the record straight back.
+    if (this.pendingChat?.id === id) this.pendingChat = undefined;
+    this.flushChats();
+    await this.store.update(
+      HISTORY_KEY,
+      this.allChats().filter((r) => r.id !== id)
+    );
     // Deleting the chat you are looking at leaves you in a fresh one.
     if (id === this.chatId) {
       this.chatId = freshId();
+      this.chatSessionId = undefined;
       this.transcript = [];
+      this.transcriptTruncated = false;
       this.post({ type: "cleared" });
     }
     this.postHistory();
@@ -453,11 +558,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       return;
     }
 
-    // Blank panel. Make Kiro's memory match what the user is looking at.
+    // Blank panel. Make Kiro's memory match what the user is looking at —
+    // and our bookkeeping too, or the new conversation is saved over the one
+    // the panel was showing before it was rebuilt.
     this.attachments = [];
     this.postAttachments();
     try {
       if (this.everConnected) {
+        this.beginFreshChat();
         await this.session.newSession();
       } else {
         await this.session.ensureReady();
@@ -744,9 +852,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.cancelPendingPermissions();
     // Keep what is on screen before it is thrown away. This used to lose the
     // conversation outright.
-    this.saveCurrentChat();
-    this.chatId = freshId();
-    this.transcript = [];
+    this.beginFreshChat();
 
     this.attachments = [];
     this.post({ type: "cleared" });
@@ -761,6 +867,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   dispose(): void {
     if (this.selectionTimer) clearTimeout(this.selectionTimer);
+    // A debounced save must not be lost to the window closing.
+    this.flushChats();
     this.cancelPendingPermissions();
     for (const w of this.watchers) w.dispose();
     this.setup.stop();
@@ -913,6 +1021,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <div id="dropzone" class="dropzone" hidden><span>Drop anywhere here to attach</span></div>
 
   <form id="composer" class="composer">
+    <div id="change-bar" class="change-bar" hidden></div>
     <div id="chips" class="chips" hidden></div>
 
     <textarea id="input" rows="2" placeholder="Ask Kiro&#8230;"></textarea>

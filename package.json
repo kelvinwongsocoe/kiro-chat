@@ -2,7 +2,7 @@
   "name": "kiro-chat",
   "displayName": "Kiro Chat",
   "description": "Chat with the Kiro agent inside VS Code, like Copilot Chat.",
-  "version": "0.10.0",
+  "version": "0.14.1",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -151,6 +151,16 @@
       {
         "command": "kiroChat.review.rejectAtCursor",
         "key": "shift+alt+enter",
+        "when": "editorTextFocus && resourceScheme == kiro-change-review && kiroChat.hunkReviewActive"
+      },
+      {
+        "command": "kiroChat.review.nextChange",
+        "key": "alt+f5",
+        "when": "editorTextFocus && resourceScheme == kiro-change-review && kiroChat.hunkReviewActive"
+      },
+      {
+        "command": "kiroChat.review.previousChange",
+        "key": "shift+alt+f5",
         "when": "editorTextFocus && resourceScheme == kiro-change-review && kiroChat.hunkReviewActive"
       }
     ],

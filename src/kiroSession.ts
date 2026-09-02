@@ -4,7 +4,9 @@ import * as path from "node:path";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { AcpClient } from "./acpClient";
-import { ChangeReviewer } from "./changeReviewer";
+import { ActiveReviewInfo, ChangeReviewer } from "./changeReviewer";
+import { isWriteLikeTool } from "./writeTools";
+import { changedSinceBaseline, describeChange, TurnChange } from "./turnChanges";
 import { findKiro } from "./findKiro";
 import { looksLikeSignIn } from "./startupError";
 import {
@@ -70,10 +72,23 @@ export interface SessionEvents {
   onModels: (models: ModelInfo[], currentModelId: string) => void;
   onUsage: (usage: UsageInfo) => void;
   onCapabilities: (caps: { image: boolean }) => void;
+  /** A review is on screen, so the chat can offer to keep or undo the lot. */
+  onReviewActive?: (info: ActiveReviewInfo | undefined) => void;
+  /** What the turn changed on disk, so the chat can offer keep or undo. */
+  onTurnChanges?: (summary: { text: string; files: TurnChange[] }) => void;
   onPermission?: (request: {
     title: string;
     options: Array<{ id: string; label: string; kind: string }>;
   }) => Promise<string | undefined>;
+}
+
+/**
+ * What the review applier last left on disk, as read back rather than as
+ * requested. Save participants can change it on the way through.
+ */
+interface AppliedState {
+  exists?: boolean;
+  content?: string;
 }
 
 interface FileSnapshot {
@@ -131,7 +146,20 @@ export class KiroSession {
   private readonly observedWriteTools = new Set<string>();
   /** A write routed through the ACP fs callback must not be reviewed twice. */
   private readonly clientReviewedPaths = new Set<string>();
+  /**
+   * Files the user already answered for, hunk by hunk, in the diff.
+   *
+   * They gave a more precise answer than the keep-or-undo card can take, so
+   * asking again afterwards is the same question a second time — and the
+   * second one cannot be answered without contradicting the first.
+   */
+  private readonly answeredPaths = new Set<string>();
   private turnCancelled = false;
+  /**
+   * Pre-turn snapshots of everything the last turn changed, kept after the
+   * turn so the keep-or-undo card can still put them back.
+   */
+  private lastTurnBaselines: FileSnapshot[] = [];
   private turnReadOnly = false;
 
   constructor(
@@ -139,6 +167,11 @@ export class KiroSession {
     private readonly events: SessionEvents
   ) {
     this.changeReviewer = new ChangeReviewer(output);
+    // The chat mirrors the diff: while a review is open it can accept or
+    // reject the whole file without walking every hunk.
+    this.changeReviewer.onDidChangeActiveReview.event((info) =>
+      this.events.onReviewActive?.(info)
+    );
   }
 
   get currentStatus(): SessionStatus {
@@ -374,6 +407,7 @@ export class KiroSession {
         content: usable,
       });
       await this.finishDirectFileReviews();
+      this.reportTurnChanges();
       // A sink means someone else asked and is showing the answer; the panel
       // must not also declare the turn over, and the error belongs to the
       // caller rather than to the transcript.
@@ -382,6 +416,7 @@ export class KiroSession {
       // An edit can succeed before a later tool fails. It still needs to be
       // restored and reviewed instead of being left behind silently.
       await this.finishDirectFileReviews();
+      this.reportTurnChanges();
       if (this.sink) throw err;
       this.events.onError(err instanceof Error ? err.message : String(err));
       this.events.onTurnEnd("error");
@@ -696,15 +731,18 @@ export class KiroSession {
     const reviewWrites = vscode.workspace
       .getConfiguration("kiroChat")
       .get<boolean>("reviewFileWrites", true);
+    const landed: AppliedState = {};
     if (reviewWrites) {
       const relative = this.displayPath(full);
       const decision = await this.changeReviewer.review({
         path: relative,
+        sourcePath: full,
         before: before.content,
         after: proposed,
         creating: !before.exists,
-        applyContent: this.createReviewApplier(full, before),
+        applyContent: this.createReviewApplier(full, before, landed),
       });
+      this.answeredPaths.add(this.pathKey(full));
       if (!decision.accepted) {
         throw new Error(`Changes to ${relative} were rejected by the user.`);
       }
@@ -716,6 +754,9 @@ export class KiroSession {
       // Per-hunk acceptance writes through immediately. If the reviewer has
       // already produced the final content, there is nothing left to apply.
       if (current.exists && current.content === approved) return;
+      // What the applier left is equally final, even when a formatter moved it
+      // away from the accepted text on the way to disk.
+      if (current.exists === landed.exists && current.content === landed.content) return;
       if (current.exists !== before.exists || current.content !== before.content) {
         throw new Error(
           `${relative} changed while its review was open. The approved changes were not applied.`
@@ -724,8 +765,7 @@ export class KiroSession {
     }
 
     if (before.exists && before.content === approved) return;
-    await fs.mkdir(path.dirname(full), { recursive: true });
-    await fs.writeFile(full, approved, "utf8");
+    await this.writeFileContent(full, approved);
   }
 
   private async readExistingFile(
@@ -742,15 +782,75 @@ export class KiroSession {
   }
 
   /**
+   * Write through VS Code rather than straight to disk, so the change lands on
+   * the file's undo stack and Ctrl+Z puts it back.
+   *
+   * A raw `fs.writeFile` is invisible to the editor: the document quietly
+   * reloads with no undo entry, which makes an accepted change permanent and
+   * leaves the chat's own undo as the only way back. Anything the user can
+   * accept they must be able to undo the ordinary way, in the file, where they
+   * are already looking.
+   *
+   * Returns false if the edit could not be made that way — a file that is not
+   * openable as text, or a rejected edit — so the caller can fall back to
+   * writing it directly. A change on disk without undo still beats no change.
+   */
+  private async writeThroughEditor(full: string, content: string): Promise<boolean> {
+    const uri = vscode.Uri.file(full);
+    try {
+      let document: vscode.TextDocument | undefined;
+      try {
+        document = await vscode.workspace.openTextDocument(uri);
+      } catch {
+        document = undefined;
+      }
+
+      const edit = new vscode.WorkspaceEdit();
+      if (document) {
+        const end = document.positionAt(document.getText().length);
+        edit.replace(uri, new vscode.Range(new vscode.Position(0, 0), end), content);
+      } else {
+        edit.createFile(uri, { overwrite: true, contents: Buffer.from(content, "utf8") });
+      }
+      if (!(await vscode.workspace.applyEdit(edit))) return false;
+      // applyEdit leaves the document dirty; the file on disk is what Kiro and
+      // the rest of this class read back, so it has to be saved.
+      if (document) await document.save();
+      return true;
+    } catch (err) {
+      this.output.appendLine(
+        `Could not write ${this.displayPath(full)} through the editor: ` +
+          `${err instanceof Error ? err.message : String(err)}`
+      );
+      return false;
+    }
+  }
+
+  /** Write a file, preferring the undoable route. */
+  private async writeFileContent(full: string, content: string): Promise<void> {
+    if (await this.writeThroughEditor(full, content)) return;
+    await fs.mkdir(path.dirname(full), { recursive: true });
+    await fs.writeFile(full, content, "utf8");
+  }
+
+  /**
    * Apply accepted hunks as soon as their CodeLens action is clicked. Every
    * write is conditional on the exact state produced by the previous action,
    * so typing or another tool touching the file aborts instead of being lost.
    */
   private createReviewApplier(
     full: string,
-    before: { exists: boolean; content: string }
+    before: { exists: boolean; content: string },
+    landed?: AppliedState
   ): (content: string, exists: boolean) => Promise<void> {
     let expected = { ...before };
+    const record = (exists: boolean, content: string): void => {
+      expected = { exists, content };
+      if (landed) {
+        landed.exists = exists;
+        landed.content = content;
+      }
+    };
     return async (content, exists) => {
       const current = await this.readExistingFile(full);
       if (current.exists !== expected.exists || current.content !== expected.content) {
@@ -758,9 +858,20 @@ export class KiroSession {
       }
 
       if (exists) {
-        await fs.mkdir(path.dirname(full), { recursive: true });
-        await fs.writeFile(full, content, "utf8");
-        expected = { exists: true, content };
+        await this.writeFileContent(full, content);
+        /*
+         * Track the file, not the request.
+         *
+         * Writing through the editor means saving, and saving runs the save
+         * participants — format-on-save among them — so what lands is not
+         * necessarily byte for byte what was accepted. Recording the request
+         * instead would make the next hunk look like somebody else editing
+         * the file, and every decision after the first would be refused: the
+         * review would never settle and the accepted change would never
+         * arrive. Re-read and believe the disk.
+         */
+        const written = await this.readExistingFile(full);
+        record(written.exists, written.content);
         return;
       }
 
@@ -769,7 +880,7 @@ export class KiroSession {
       } catch (err) {
         if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
       }
-      expected = { exists: false, content: "" };
+      record(false, "");
     };
   }
 
@@ -784,6 +895,7 @@ export class KiroSession {
     this.directFileChanges.clear();
     this.observedWriteTools.clear();
     this.clientReviewedPaths.clear();
+    this.answeredPaths.clear();
     this.turnCancelled = false;
 
     for (const block of blocks) {
@@ -827,17 +939,12 @@ export class KiroSession {
 
   /** Record the path and expected content from a built-in edit tool update. */
   private observeDirectFileWrite(update: any): void {
+    // Shared with askPermission, which uses the same answer to decide that an
+    // edit does not need a prompt of its own. Two copies of this heuristic
+    // would eventually disagree, and the symptom would be a stray prompt.
+    if (!isWriteLikeTool(update)) return;
+
     const raw = update?.rawInput ?? update?.input ?? update?.toolCall?.rawInput;
-    const title = String(update?.title ?? update?.toolCall?.title ?? "").toLowerCase();
-    const toolKind = normaliseKind(update?.kind ?? update?.toolCall?.kind);
-    const command = String(raw?.command ?? raw?.mode ?? "").toLowerCase();
-    const writeLike =
-      toolKind === "edit" ||
-      toolKind === "write" ||
-      title.startsWith("editing ") ||
-      title.startsWith("writing ") ||
-      ["strreplace", "replace", "write", "create", "overwrite"].includes(command);
-    if (!writeLike) return;
 
     const target = raw?.path ?? raw?.filePath ?? raw?.file_path;
     if (typeof target !== "string" || !target) return;
@@ -911,13 +1018,28 @@ export class KiroSession {
       }
 
       const relative = this.displayPath(tracked.before.full);
+
+      /*
+       * `expected` is a simulation of what Kiro's tool input should produce,
+       * chained across every edit to this file in the turn. It used to have to
+       * match the file byte for byte or the review was abandoned.
+       *
+       * That was backwards. The simulation drifts for entirely ordinary
+       * reasons — several edits to one file, a replace the simulation models
+       * differently from Kiro — and when it drifted the review was skipped
+       * while Kiro's edit stayed on disk. The one outcome nobody wants is an
+       * unreviewed edit, and that is precisely what it produced.
+       *
+       * The review does not need the prediction to be right. It shows what is
+       * on disk now against the pre-turn snapshot and lets the user decide, so
+       * a surprise is something they see rather than something that is applied
+       * behind a warning. The mismatch is still worth logging.
+       */
       if (tracked.expected !== undefined && current.content !== tracked.expected) {
-        const message =
-          `${relative} no longer matches Kiro's proposed edit, so it was left untouched ` +
-          "instead of risking another change made during the turn.";
-        this.output.appendLine(message);
-        this.events.onError(message);
-        continue;
+        this.output.appendLine(
+          `${relative} does not match the simulated result of Kiro's edit. ` +
+            "Reviewing what is actually on disk instead."
+        );
       }
 
       if (!reviewWrites && allowWrites && !this.turnCancelled) continue;
@@ -936,16 +1058,20 @@ export class KiroSession {
         continue;
       }
 
+      const landed: AppliedState = {};
       const decision = await this.changeReviewer.review({
         path: relative,
+        sourcePath: tracked.before.full,
         before: tracked.before.content,
         after: current.content,
         creating: !tracked.before.exists,
-        applyContent: this.createReviewApplier(tracked.before.full, {
-          exists: tracked.before.exists,
-          content: tracked.before.content,
-        }),
+        applyContent: this.createReviewApplier(
+          tracked.before.full,
+          { exists: tracked.before.exists, content: tracked.before.content },
+          landed
+        ),
       });
+      this.answeredPaths.add(key);
       if (!decision.accepted) {
         this.output.appendLine(`Kept the original ${relative}.`);
         continue;
@@ -953,6 +1079,9 @@ export class KiroSession {
 
       const now = await this.readExistingFile(tracked.before.full);
       if (now.exists && now.content === decision.content) continue;
+      // A formatter running on save leaves the file final but not identical to
+      // the accepted text. That is the applier's work, not an outside edit.
+      if (now.exists === landed.exists && now.content === landed.content) continue;
       if (now.exists !== tracked.before.exists || now.content !== tracked.before.content) {
         const message = `${relative} changed while its review was open. The approved lines were not applied.`;
         this.output.appendLine(message);
@@ -960,11 +1089,102 @@ export class KiroSession {
         continue;
       }
       if (tracked.before.exists && decision.content === tracked.before.content) continue;
-      await fs.mkdir(path.dirname(tracked.before.full), { recursive: true });
-      await fs.writeFile(tracked.before.full, decision.content, "utf8");
+      await this.writeFileContent(tracked.before.full, decision.content);
     }
   }
 
+  /**
+   * Tell the chat what the turn actually changed, so it can offer to keep or
+   * undo the lot.
+   *
+   * Compared against the pre-turn snapshots rather than assumed from what Kiro
+   * said it would do: a rejected review restores the original, and Kiro
+   * sometimes rewrites a file with what it already held. Neither is a change,
+   * and offering to undo one would be offering to undo nothing.
+   */
+  private reportTurnChanges(): void {
+    if (!this.events.onTurnChanges) return;
+
+    const baselines = [...this.turnBaselines.values()];
+    const changes = changedSinceBaseline(baselines, (full) => this.snapshotSync(full))
+      // Anything decided hunk by hunk in the diff has already been answered.
+      .filter((change) => !this.answeredPaths.has(this.pathKey(change.path)))
+      .map((change) => ({
+        ...change,
+        label: vscode.workspace.asRelativePath(change.path),
+      }));
+
+    // Keep only the snapshots we might have to put back.
+    const changedPaths = new Set(changes.map((change) => this.pathKey(change.path)));
+    this.lastTurnBaselines = baselines.filter((snapshot) =>
+      changedPaths.has(this.pathKey(snapshot.full))
+    );
+
+    if (changes.length === 0) return;
+    this.output.appendLine(
+      `Turn changed ${changes.length} file(s): ${changes.map((c) => c.label).join(", ")}.`
+    );
+    this.events.onTurnChanges({ text: describeChange(changes), files: changes });
+  }
+
+  /**
+   * Put every file the last turn changed back as it was. Used by the chat's
+   * "Undo all" once the user has seen what happened.
+   */
+  async undoLastTurn(): Promise<number> {
+    const snapshots = this.lastTurnBaselines;
+    this.lastTurnBaselines = [];
+    let restored = 0;
+
+    for (const snapshot of snapshots) {
+      try {
+        await this.restoreSnapshot(snapshot);
+        restored++;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.output.appendLine(`Could not undo ${snapshot.full}: ${message}`);
+        this.events.onError(`Could not undo ${snapshot.full}: ${message}`);
+      }
+    }
+    this.output.appendLine(`Undid ${restored} of ${snapshots.length} changed file(s).`);
+    return restored;
+  }
+
+  /** Accept every pending hunk of the review on screen. */
+  acceptActiveReview(): Promise<void> {
+    return this.changeReviewer.acceptActive();
+  }
+
+  /** Reject the review on screen, restoring the original file. */
+  rejectActiveReview(): Promise<void> {
+    return this.changeReviewer.rejectActive();
+  }
+
+  /**
+   * Jump to the next undecided change.
+   *
+   * The chat panel needs this as well as the editor: the diff is often behind
+   * the chat, and from there the user cannot reach a keybinding that only
+   * fires while the review has focus.
+   */
+  gotoNextChange(): Promise<void> {
+    return this.changeReviewer.gotoNext();
+  }
+
+  /** The user kept the changes; there is nothing left to put back. */
+  keepLastTurn(): void {
+    this.lastTurnBaselines = [];
+  }
+
+  /*
+   * Restoring stays on the raw disk write, unlike an accepted change.
+   *
+   * Putting a file back is not an edit the user made, and it has to be exact.
+   * Going through the editor would save it, and saving runs format-on-save —
+   * so rejecting a change could leave the file reformatted rather than as it
+   * was. An accepted change is the opposite case: there the formatter is
+   * welcome, because that is what saving the same edit by hand would do.
+   */
   private async restoreSnapshot(snapshot: FileSnapshot): Promise<void> {
     if (snapshot.exists) {
       await fs.mkdir(path.dirname(snapshot.full), { recursive: true });
@@ -980,15 +1200,42 @@ export class KiroSession {
 
   private async askPermission(params: any): Promise<any> {
     const options: any[] = Array.isArray(params?.options) ? params.options : [];
-    const autoApprove = vscode.workspace
-      .getConfiguration("kiroChat")
-      .get<boolean>("autoApproveTools", false);
+    const config = vscode.workspace.getConfiguration("kiroChat");
+    const autoApprove = config.get<boolean>("autoApproveTools", false);
 
     if (options.length === 0) return { outcome: { outcome: "cancelled" } };
 
+    const allowOption = () =>
+      options.find((o) => String(o.kind ?? "").startsWith("allow")) ?? options[0];
+
     if (autoApprove) {
-      const allow =
-        options.find((o) => String(o.kind ?? "").startsWith("allow")) ?? options[0];
+      const allow = allowOption();
+      return { outcome: { outcome: "selected", optionId: allow.optionId ?? allow.id } };
+    }
+
+    /*
+     * An edit gets one gate, not two.
+     *
+     * Asking "may I write this file?" and then opening a diff that asks
+     * "keep these changes?" is the same question twice, and the first one is
+     * the useless one: it is asked before there is anything to look at. The
+     * review is where the user can actually see what is proposed, so when it
+     * is going to open, let the edit through and let the diff do the asking.
+     *
+     * Only when the review will really open. With review off, or writing off,
+     * or in a read-only workflow, this prompt is the only gate there is.
+     */
+    const reviewWillOpen =
+      config.get<boolean>("reviewFileWrites", true) &&
+      config.get<boolean>("allowFileWrites", true) &&
+      !this.turnReadOnly;
+
+    if (reviewWillOpen && isWriteLikeTool(params?.toolCall ?? params)) {
+      const allow = allowOption();
+      this.output.appendLine(
+        `Letting an edit through without a prompt; the review diff is the gate: ` +
+          `${String(params?.toolCall?.title ?? params?.toolCall?.kind ?? "edit")}`
+      );
       return { outcome: { outcome: "selected", optionId: allow.optionId ?? allow.id } };
     }
 

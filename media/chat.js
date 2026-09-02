@@ -67,22 +67,38 @@
   // want to survive that has to live in webview state.
   let history = [];
   const MAX_HISTORY = 120;
+  /** True once the chat is longer than we can keep, so the tail is all there is. */
+  let historyTruncated = false;
 
-  function saveState() {
+  /**
+   * `report` is false when the transcript we are holding came *from* the
+   * extension — reopening a past chat. Sending it straight back made the
+   * extension re-save the record, which bumped its timestamp to now (a chat
+   * jumped to Today just for being read) and re-stamped its session id while
+   * `session/load` was still in flight, binding it to the previous chat.
+   */
+  function saveState(report) {
+    historyTruncated = historyTruncated || history.length > MAX_HISTORY;
     try {
       vscode.setState({
         history: history.slice(-MAX_HISTORY),
+        historyTruncated,
         includeSelection,
         mode: currentModeId,
       });
     } catch (err) {
       // State is a convenience. Never let it break the panel.
     }
+    if (report === false) return;
     // Webview state dies with the panel, so hand the same transcript to the
     // extension, which can keep it in the chat history. This fires per turn,
     // not per chunk, so it is not chatty.
     try {
-      vscode.postMessage({ type: "transcript", history: history.slice(-MAX_HISTORY) });
+      vscode.postMessage({
+        type: "transcript",
+        history: history.slice(-MAX_HISTORY),
+        truncated: historyTruncated,
+      });
     } catch (err) {
       // Same again: never let bookkeeping break the chat.
     }
@@ -859,10 +875,12 @@
   });
 
   document.addEventListener("keydown", (event) => {
-    if (event.key === "Escape") {
-      closeMenus();
-      setUsagePanel(false);
-    }
+    if (event.key !== "Escape") return;
+    closeMenus();
+    setUsagePanel(false);
+    // The list takes over the whole panel, so Escape is the way out of it
+    // that every other overlay in the editor already teaches.
+    if (historyOpen) closeHistory();
   });
 
   // ---------------------------------------------------------------
@@ -1420,6 +1438,14 @@
   // threw the list away, so reopening it showed "no past chats".
   let historyData = null;
   let historyOpen = false;
+  /** What the user has typed into the filter box. */
+  let historyQuery = "";
+
+  function matchesQuery(chat, query) {
+    if (!query) return true;
+    const hay = (chat.title + " " + (chat.preview || "")).toLowerCase();
+    return hay.indexOf(query) >= 0;
+  }
 
   function renderHistory() {
     if (!historyOpen) return;
@@ -1440,12 +1466,53 @@
     bar.appendChild(back);
     wrap.appendChild(bar);
 
-    const groups = view.groups || [];
-    if (groups.length === 0) {
+    const allGroups = view.groups || [];
+    const query = historyQuery.trim().toLowerCase();
+    const groups = allGroups
+      .map((group) => ({
+        label: group.label,
+        chats: (group.chats || []).filter((chat) => matchesQuery(chat, query)),
+      }))
+      .filter((group) => group.chats.length > 0);
+
+    const total = allGroups.reduce((sum, g) => sum + (g.chats || []).length, 0);
+    // A filter box over three chats is clutter; over fifty it is the only way
+    // through, because the titles repeat.
+    if (total > 5) {
+      const search = document.createElement("input");
+      search.type = "search";
+      search.className = "history-search";
+      search.placeholder = "Search past chats";
+      search.value = historyQuery;
+      search.setAttribute("aria-label", "Search past chats");
+      search.addEventListener("input", () => {
+        historyQuery = search.value;
+        const at = search.selectionStart;
+        renderHistory();
+        // Redrawing replaces the box, so put the caret back where it was.
+        const next = messagesEl.querySelector(".history-search");
+        if (next) {
+          next.focus();
+          try {
+            next.setSelectionRange(at, at);
+          } catch (err) {
+            // Some input types refuse a selection range. Focus is enough.
+          }
+        }
+      });
+      wrap.appendChild(search);
+    }
+
+    if (allGroups.length === 0) {
       const empty = document.createElement("p");
       empty.className = "history-empty";
       empty.textContent =
         "No past chats in this folder yet. They are saved as you talk.";
+      wrap.appendChild(empty);
+    } else if (groups.length === 0) {
+      const empty = document.createElement("p");
+      empty.className = "history-empty";
+      empty.textContent = "No chat here matches “" + historyQuery.trim() + "”.";
       wrap.appendChild(empty);
     }
 
@@ -1471,6 +1538,15 @@
         title.textContent = chat.title;
         open.appendChild(title);
 
+        // Chats open with whatever was on the user's mind, so titles repeat.
+        // The newest line is what tells two otherwise identical rows apart.
+        if (chat.preview && chat.preview !== chat.title) {
+          const preview = document.createElement("div");
+          preview.className = "history-preview";
+          preview.textContent = chat.preview;
+          open.appendChild(preview);
+        }
+
         const meta = document.createElement("div");
         meta.className = "history-meta";
         const count = chat.messageCount === 1 ? "1 message" : chat.messageCount + " messages";
@@ -1486,11 +1562,12 @@
 
         const remove = document.createElement("button");
         remove.type = "button";
-        remove.className = "chip-x history-delete";
+        remove.className = "history-delete";
         remove.dataset.act = "delete";
         remove.dataset.id = chat.id;
         remove.textContent = "×";
         remove.title = "Forget this chat";
+        remove.setAttribute("aria-label", "Forget “" + chat.title + "”");
         row.appendChild(remove);
 
         wrap.appendChild(row);
@@ -1517,8 +1594,12 @@
   function openHistory() {
     if (setup) return; // setup has more to say than an empty list
     historyOpen = true;
+    historyQuery = "";
     setComposerEnabled(false, "Pick a chat, or go back");
     renderHistory();
+    // Draw whatever we already have, then ask for the current list rather
+    // than showing a stale one.
+    vscode.postMessage({ type: "requestHistory" });
   }
 
   /** Put the conversation back exactly as it was. */
@@ -1528,6 +1609,105 @@
     messagesEl.innerHTML = "";
     if (history.length > 0) restoreHistory(history);
     else messagesEl.appendChild(emptyState());
+  }
+
+  // ---------------------------------------------------------------
+  // Keep or undo, pinned above the message box
+  //
+  // This sits outside the transcript on purpose. It appears the moment the
+  // inline diff opens, so both routes are available at the same time: decide
+  // each hunk in the diff, or take the whole lot from here. Inside the
+  // transcript it would scroll away exactly when it is needed.
+  // ---------------------------------------------------------------
+
+  const changeBar = el("change-bar");
+  /** The review currently on screen, if any. */
+  let pendingReview = null;
+  /** What the last finished turn changed, if it has not been answered yet. */
+  let pendingChanges = null;
+
+  function renderChangeBar() {
+    const review = pendingReview;
+    const changes = pendingChanges;
+    if (!review && !changes) {
+      changeBar.hidden = true;
+      changeBar.innerHTML = "";
+      return;
+    }
+
+    changeBar.innerHTML = "";
+    changeBar.hidden = false;
+
+    // While a review is open the summary is itself the way through the
+    // changes, the way a merge conflict is walked: click it and the editor
+    // goes to a change, click it again and it goes to the next one. A separate
+    // button for that was a third thing competing with the two decisions.
+    const summary = document.createElement(review ? "button" : "div");
+    summary.className = "change-summary";
+    if (review) {
+      const left = Math.max(0, review.hunks - review.decided);
+      const name = review.path.split(/[\\/]/).pop();
+      summary.type = "button";
+      summary.title = "Show this change in the editor. Click again for the next one.";
+      summary.textContent =
+        left === 1
+          ? `Reviewing ${name} — 1 change left`
+          : `Reviewing ${name} — ${left} changes left`;
+      const hint = document.createElement("span");
+      hint.className = "change-jump";
+      hint.textContent = "›";
+      summary.appendChild(hint);
+      summary.addEventListener("click", () => {
+        vscode.postMessage({ type: "gotoChange" });
+      });
+    } else {
+      summary.textContent = changes.text || "Kiro changed some files.";
+    }
+    changeBar.appendChild(summary);
+
+    // Naming them matters: "3 files" is not something you can agree to.
+    if (!review && changes.files.length > 1) {
+      const list = document.createElement("ul");
+      list.className = "change-files";
+      for (const file of changes.files) {
+        const item = document.createElement("li");
+        item.dataset.kind = file.kind;
+        item.textContent = file.label || file.path;
+        list.appendChild(item);
+      }
+      changeBar.appendChild(list);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "change-actions";
+
+    const keep = document.createElement("button");
+    keep.type = "button";
+    keep.textContent = "Keep all changes";
+    const undo = document.createElement("button");
+    undo.type = "button";
+    undo.className = "ghost";
+    undo.textContent = review ? "Reject all changes" : "Undo all changes";
+
+    const settle = () => {
+      keep.disabled = true;
+      undo.disabled = true;
+    };
+    keep.addEventListener("click", () => {
+      settle();
+      vscode.postMessage({ type: "keepChanges" });
+      pendingReview = null;
+      pendingChanges = null;
+      renderChangeBar();
+    });
+    undo.addEventListener("click", () => {
+      settle();
+      vscode.postMessage({ type: "undoChanges" });
+    });
+
+    actions.appendChild(keep);
+    actions.appendChild(undo);
+    changeBar.appendChild(actions);
   }
 
   // ---------------------------------------------------------------
@@ -1661,6 +1841,31 @@
         finishAgentBubble();
         break;
 
+      case "reviewActive":
+        // Offered the moment the diff opens, so the whole file can be taken
+        // or dropped without walking every hunk.
+        pendingReview = message.review || null;
+        renderChangeBar();
+        break;
+
+      case "turnChanges":
+        finishAgentBubble();
+        pendingChanges = { text: message.text, files: message.files || [] };
+        renderChangeBar();
+        break;
+
+      case "changesUndone":
+        pendingReview = null;
+        pendingChanges = null;
+        renderChangeBar();
+        addBubble(
+          "note",
+          message.restored === 1
+            ? "Put 1 file back as it was."
+            : `Put ${message.restored} files back as they were.`
+        );
+        break;
+
       case "error":
         finishAgentBubble();
         addBubble("error", message.text);
@@ -1676,10 +1881,14 @@
         break;
 
       case "cleared":
+        pendingReview = null;
+        pendingChanges = null;
+        renderChangeBar();
         messagesEl.innerHTML = "";
         current = null;
         buffer = "";
         history = [];
+        historyTruncated = false;
         saveState();
         renderUsage({});
         // Starting a new session while Kiro is still missing must not throw
@@ -1706,10 +1915,16 @@
         // this panel. Kiro is told to reload the session separately.
         historyOpen = false;
         setComposerEnabled(true);
+        // The other chat's pending edits are not this chat's to answer.
+        pendingReview = null;
+        pendingChanges = null;
+        renderChangeBar();
         history = message.history || [];
+        historyTruncated = message.truncated === true;
         current = null;
         buffer = "";
-        saveState();
+        // Reported back, this would re-save the record we were just handed.
+        saveState(false);
         messagesEl.innerHTML = "";
         if (history.length > 0) restoreHistory(history);
         else messagesEl.appendChild(emptyState());
@@ -1743,6 +1958,14 @@
 
   function restoreHistory(saved) {
     messagesEl.innerHTML = "";
+    // Only the tail of a long chat is kept. Saying so beats letting the user
+    // wonder why the conversation appears to start in the middle.
+    if (historyTruncated) {
+      const note = document.createElement("div");
+      note.className = "history-trimmed";
+      note.textContent = "Earlier messages in this chat are no longer stored.";
+      messagesEl.appendChild(note);
+    }
     for (const item of saved) {
       if (item.role === "user") {
         addUserBubble(item);
@@ -1788,6 +2011,7 @@
   let restored = false;
   if (Array.isArray(saved.history) && saved.history.length > 0) {
     history = saved.history;
+    historyTruncated = saved.historyTruncated === true;
     if (typeof saved.includeSelection === "boolean") {
       includeSelection = saved.includeSelection;
       restoredChoice = true;

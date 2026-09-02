@@ -7,7 +7,7 @@
  * in the extension's globalState; nothing here touches storage.
  */
 
-import { samePath } from "./paths";
+import { normalisePath, samePath } from "./paths";
 
 /** One turn as the webview records it. */
 export interface HistoryItem {
@@ -29,9 +29,12 @@ export interface ChatRecord {
   updatedAt: number;
   messageCount: number;
   history: HistoryItem[];
+  /** True when the stored transcript is only the tail of a longer chat. */
+  truncated?: boolean;
 }
 
 const MAX_TITLE = 60;
+const MAX_PREVIEW = 90;
 
 /**
  * Name a chat after the first thing the user said. A message that carried
@@ -55,9 +58,46 @@ export function titleFrom(history: HistoryItem[]): string {
   return "New chat";
 }
 
-function clip(text: string): string {
-  if (text.length <= MAX_TITLE) return text;
-  return text.slice(0, MAX_TITLE - 1).trimEnd() + "…";
+function clip(text: string, max = MAX_TITLE): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max - 1).trimEnd() + "…";
+}
+
+/**
+ * The name a chat keeps.
+ *
+ * A long chat is stored as its tail, so re-deriving the title from the saved
+ * transcript renames it the moment the opening message falls out of the
+ * window — the row in the list changes under the user for no reason they can
+ * see. Once a chat has a real name it keeps it; only the placeholder is
+ * allowed to be replaced.
+ */
+export function stableTitle(
+  existing: string | undefined,
+  history: HistoryItem[]
+): string {
+  const kept = String(existing ?? "").trim();
+  if (kept && kept !== "New chat") return kept;
+  return titleFrom(history);
+}
+
+/**
+ * A line of the conversation to show under the title.
+ *
+ * Real chats open with whatever was on the user's mind — "fix this", "change
+ * null to true" — so titles repeat, and a list of identical rows cannot be
+ * told apart by name. The newest message is what actually distinguishes them.
+ */
+export function previewOf(history: HistoryItem[]): string {
+  for (let i = (history ?? []).length - 1; i >= 0; i--) {
+    const item = history[i];
+    const line = String(item?.text ?? "")
+      .split("\n")
+      .map((part) => part.trim())
+      .find((part) => part.length > 0);
+    if (line) return clip(line, MAX_PREVIEW);
+  }
+  return "";
 }
 
 export interface DayGroup {
@@ -113,11 +153,26 @@ export function forWorkspace(
   return (records ?? []).filter((record) => samePath(record.cwd, cwd));
 }
 
-/** Keep the newest `max` chats and drop the rest. */
+/**
+ * Keep the newest `max` chats **per folder** and drop the rest.
+ *
+ * The list only ever shows one folder's chats, so a global cap means a busy
+ * project quietly evicts a quiet one's history — the user loses chats from a
+ * repo they have not touched in a week because of work done somewhere else.
+ * Counting per folder makes the cap mean what the list shows.
+ */
 export function pruneHistory(records: ChatRecord[], max: number): ChatRecord[] {
+  const limit = Math.max(0, max);
+  const seen = new Map<string, number>();
   return [...(records ?? [])]
     .sort((a, b) => b.updatedAt - a.updatedAt)
-    .slice(0, Math.max(0, max));
+    .filter((record) => {
+      const folder = normalisePath(record.cwd);
+      const count = seen.get(folder) ?? 0;
+      if (count >= limit) return false;
+      seen.set(folder, count + 1);
+      return true;
+    });
 }
 
 /** Save a chat, replacing any earlier save of the same one. */

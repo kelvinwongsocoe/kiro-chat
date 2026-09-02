@@ -964,21 +964,61 @@ button:disabled {
 .history {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 1px;
 }
 
 .history-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
   margin-bottom: 10px;
 }
 
+.history-search {
+  width: 100%;
+  box-sizing: border-box;
+  margin-bottom: 10px;
+  padding: 6px 10px;
+  border: 1px solid var(--vscode-input-border, transparent);
+  border-radius: 6px;
+  background: var(--vscode-input-background);
+  color: var(--vscode-input-foreground);
+  font: inherit;
+  transition: border-color 120ms ease;
+}
+
+.history-search::placeholder {
+  color: var(--vscode-input-placeholderForeground, var(--vscode-descriptionForeground));
+}
+
+/* One ring, drawn inside, rather than the browser's own outline on top. */
+.history-search:focus {
+  outline: none;
+  border-color: var(--vscode-focusBorder);
+  box-shadow: 0 0 0 1px var(--vscode-focusBorder);
+}
+
 .linkish {
-  padding: 2px 0;
+  padding: 3px 7px;
+  margin-left: -7px;
   border: none;
+  border-radius: 5px;
   background: none;
   font: inherit;
   font-size: 0.85em;
   cursor: pointer;
   color: var(--vscode-textLink-foreground);
+  transition: background-color 120ms ease;
+}
+
+.linkish:hover {
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  color: var(--vscode-textLink-activeForeground, var(--vscode-textLink-foreground));
+}
+
+.linkish:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
 }
 
 .history-empty {
@@ -989,44 +1029,72 @@ button:disabled {
 }
 
 .history-day {
-  margin: 14px 0 4px;
+  margin: 18px 0 6px;
+  padding-left: 2px;
   font-size: 0.72em;
+  font-weight: 600;
   letter-spacing: 0.08em;
   text-transform: uppercase;
   color: var(--vscode-descriptionForeground);
-  opacity: 0.8;
 }
 
 .history-day:first-of-type {
   margin-top: 0;
 }
 
+/*
+ * The accent bar for the open chat is drawn on the row itself rather than as
+ * an extra element, so it cannot push the text out of line.
+ */
 .history-row {
+  position: relative;
   display: flex;
   align-items: center;
-  border-radius: 3px;
+  border-radius: 6px;
+  transition: background-color 120ms ease;
 }
 
 .history-row:hover {
   background: var(--vscode-list-hoverBackground);
 }
 
-/* The chat you are already in, so reopening it is obviously a no-op. */
+/*
+ * The chat you are already in. A tint plus an accent bar, not the solid
+ * selection block: the block repaints the preview and the timestamp in the
+ * selection foreground, where the muted greys that make them secondary text
+ * have nothing to be muted against.
+ */
 .history-row.current {
-  background: var(--vscode-list-activeSelectionBackground);
-  color: var(--vscode-list-activeSelectionForeground);
+  background: var(--vscode-list-inactiveSelectionBackground, var(--vscode-list-hoverBackground));
+}
+
+.history-row.current::before {
+  content: "";
+  position: absolute;
+  top: 6px;
+  bottom: 6px;
+  left: 0;
+  width: 2px;
+  border-radius: 0 2px 2px 0;
+  background: var(--vscode-focusBorder);
 }
 
 .history-open {
   flex: 1 1 auto;
   min-width: 0;
-  padding: 7px 9px;
+  padding: 8px 4px 8px 11px;
   border: none;
+  border-radius: 6px;
   background: none;
   color: inherit;
   font: inherit;
   text-align: left;
   cursor: pointer;
+}
+
+.history-open:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
 }
 
 .history-title {
@@ -1035,15 +1103,75 @@ button:disabled {
   white-space: nowrap;
 }
 
-.history-meta {
-  margin-top: 2px;
-  font-size: 0.8em;
-  opacity: 0.7;
+.history-row.current .history-title {
+  font-weight: 600;
 }
 
+/* The line that tells two chats with the same title apart. */
+.history-preview {
+  overflow: hidden;
+  margin-top: 3px;
+  font-size: 0.85em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground);
+}
+
+.history-meta {
+  margin-top: 3px;
+  font-size: 0.78em;
+  color: var(--vscode-descriptionForeground);
+  opacity: 0.85;
+}
+
+/*
+ * The × keeps out of the way until the row is pointed at or tabbed to, so it
+ * is never sitting under the cursor of someone aiming at the chat beside it.
+ * `visibility` rather than `display`, so the row does not resize on hover.
+ */
 .history-delete {
   flex: 0 0 auto;
-  margin-right: 5px;
+  width: 22px;
+  height: 22px;
+  margin-right: 7px;
+  padding: 0;
+  border: none;
+  border-radius: 5px;
+  background: none;
+  color: var(--vscode-descriptionForeground);
+  font: inherit;
+  line-height: 1;
+  cursor: pointer;
+  visibility: hidden;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
+}
+
+.history-row:hover .history-delete,
+.history-row:focus-within .history-delete {
+  visibility: visible;
+}
+
+.history-delete:hover {
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  color: var(--vscode-errorForeground);
+}
+
+.history-delete:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+/* Says the stored transcript is only the tail of a longer conversation. */
+.history-trimmed {
+  margin: 0 0 10px;
+  padding: 7px 11px;
+  border-left: 2px solid var(--vscode-panel-border);
+  border-radius: 0 6px 6px 0;
+  background: var(--vscode-textBlockQuote-background);
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
 }
 
 /* --- account usage panel -------------------------------------------- */
@@ -1110,4 +1238,83 @@ button:disabled {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* --- keep or undo what the turn changed ----------------------------- */
+
+/*
+ * Asked once, after the turn, when you can finally see the whole picture.
+ * The per-hunk review already decided each edit; this is the question about
+ * all of them together.
+ */
+.change-bar {
+  flex: 0 0 auto;
+  padding: 9px 11px;
+  border-radius: var(--radius);
+  border: 1px solid var(--vscode-focusBorder);
+  background: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.08));
+}
+
+.change-summary {
+  font-size: 0.92em;
+}
+
+/*
+ * While a review is open the summary is a button, so it has to opt out of the
+ * global button styling the way .usage-bar does — otherwise the whole line
+ * paints as a solid primary-coloured block.
+ */
+button.change-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  padding: 0;
+  border: none;
+  border-radius: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  font-size: 0.92em;
+  text-align: left;
+  cursor: pointer;
+}
+
+button.change-summary:hover {
+  text-decoration: underline;
+}
+
+.change-jump {
+  flex: 0 0 auto;
+  opacity: 0.65;
+  font-size: 1.25em;
+  line-height: 1;
+}
+
+.change-files {
+  margin: 8px 0 0;
+  padding-left: 1.1em;
+  font-size: 0.85em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.change-files li {
+  margin-bottom: 2px;
+}
+
+/* What happened to each file, without a legend to look up. */
+.change-files li[data-kind="created"]::marker {
+  content: "+ ";
+}
+
+.change-files li[data-kind="deleted"]::marker {
+  content: "\2212 ";
+}
+
+.change-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
 }
