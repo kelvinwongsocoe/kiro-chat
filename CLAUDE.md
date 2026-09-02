@@ -56,7 +56,29 @@ A feature almost always means editing both:
 
 ### Kiro calls back into us
 
-`KiroSession.handleRequest` answers `fs/read_text_file`, `fs/write_text_file` and `session/request_permission`. **Every file path goes through `resolveInsideWorkspace`**, which rejects anything resolving outside the open folder. That function is the security boundary — don't route file access around it. Writes additionally check `kiroChat.allowFileWrites`.
+`KiroSession.handleRequest` answers `fs/read_text_file`, `fs/write_text_file` and `session/request_permission`. **Every file path goes through `resolveInsideWorkspace`**, which accepts every root in a multi-root workspace and rejects anything outside all open folders. That function is the security boundary — don't route file access around it. Writes additionally check `kiroChat.allowFileWrites`.
+
+With `kiroChat.reviewFileWrites` enabled, `ChangeReviewer` holds the write request open and
+opens a read-only virtual source document in the editor. Theme-aware decorations mark pending
+deletions red and insertions green, while a CodeLens provider supplies whole-file and per-hunk
+Accept/Reject actions. A theme-aware marker decoration makes every pending hunk visibly distinct;
+VS Code does not expose button styling for CodeLens itself. Accepted hunks write through immediately via `createReviewApplier`;
+the virtual document then collapses that hunk to its accepted side and clears its decorations.
+Reviews are serialised; closing the tab, cancelling the turn, or changing the file on disk
+during review rejects pending work. `lineDiff.ts` remains independent of VS Code and combines
+the accepted hunks.
+
+`session/request_permission` belongs in the chat webview. `KiroSession.askPermission`
+passes Kiro's option ids and labels through `SessionEvents.onPermission`; the provider
+posts an inline permission card and resolves the request when `chat.js` returns a
+`permissionDecision`. The VS Code notification is only a fallback when no panel exists.
+
+Kiro CLI 2.21 does not use that callback for its built-in `FileWrite` tool: it writes the
+workspace itself. `KiroSession` therefore snapshots attached files at turn start, captures
+other paths from edit tool updates, and at the end of the turn restores their baselines
+before opening `ChangeReviewer`. The prompt stays busy until those reviews settle. Keep the
+callback path and the built-in-tool path covered; different Kiro versions use different
+ones.
 
 The extension advertises `terminal: false` in its client capabilities, so Kiro never asks to run shell commands.
 
@@ -69,6 +91,10 @@ These are the things that were expensive to discover; the comments in `kiroSessi
 - **Credit rates need a second call.** The model list returned by `session/new` carries no rate; only the `model` command has `rateMultiplier` and the context window. `enrichModels()` fetches it in the background after connecting.
 - **The usage meter arrives two ways** — as a `_kiro.dev/metadata` notification, and sometimes bolted onto an ordinary `session/update`. `handleNotification` reads both; dropping either leaves the usage strip blank for a whole conversation.
 - `session/prompt` is sent with the payload under **both** `prompt` and `content`, because Kiro's docs and the ACP spec disagree on the field name.
+- The five composer workflows live in `chatModes.ts`. They are explicit prompt instructions,
+  rather than claims that Kiro ACP natively exposes all five. Plan additionally passes
+  `readOnly` to `KiroSession.send`; callback writes are refused and direct CLI writes are
+  restored at the end of the turn.
 
 ### What kiro-cli 2.20.2 actually reports
 
@@ -84,7 +110,9 @@ agentCapabilities: {
 
 - **`loadSession: true`, and session ids survive the CLI process dying.** A session created by one process loads in a fresh one, which is what makes chat history able to resume rather than just replay.
 - On load, Kiro sent no conversation replay — only `_kiro.dev/subagent/list_update`. The session under test was empty so that isn't conclusive, which is exactly why the panel redraws from its own stored transcript and `KiroSession.replaying` swallows `session/update` during the load call. If Kiro does replay, you get it once, not twice.
-- Kiro also exposes **modes** (`kiro_default`, `kiro_planner`, `kiro_guide`) that the panel does not surface at all. Unclaimed feature.
+- Kiro also reports three native mode ids (`kiro_default`, `kiro_planner`, `kiro_guide`).
+  They do not map one-to-one to the five composer workflows, so the workflow picker remains
+  explicit and deterministic instead of presenting incompatible ids as the same feature.
 
 ## Chat history
 

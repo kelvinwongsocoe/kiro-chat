@@ -1,8 +1,10 @@
 import * as vscode from "vscode";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { AcpClient } from "./acpClient";
+import { ChangeReviewer } from "./changeReviewer";
 import { findKiro } from "./findKiro";
 import { looksLikeSignIn } from "./startupError";
 import {
@@ -52,6 +54,11 @@ export interface TurnSink {
   onTool?: (tool: { id: string; title: string; status: string }) => void;
 }
 
+export interface SendOptions {
+  /** Refuse and restore all writes made during this turn. */
+  readOnly?: boolean;
+}
+
 export interface SessionEvents {
   onStatus: (status: SessionStatus, detail?: string) => void;
   onText: (text: string) => void;
@@ -63,6 +70,22 @@ export interface SessionEvents {
   onModels: (models: ModelInfo[], currentModelId: string) => void;
   onUsage: (usage: UsageInfo) => void;
   onCapabilities: (caps: { image: boolean }) => void;
+  onPermission?: (request: {
+    title: string;
+    options: Array<{ id: string; label: string; kind: string }>;
+  }) => Promise<string | undefined>;
+}
+
+interface FileSnapshot {
+  full: string;
+  exists: boolean;
+  content: string;
+}
+
+interface DirectFileChange {
+  before: FileSnapshot;
+  /** What Kiro's tool input says the file should contain after this edit. */
+  expected?: string;
 }
 
 function contentToText(content: any): string {
@@ -101,11 +124,22 @@ export class KiroSession {
    * stream rather than in the webview's transcript.
    */
   private sink: TurnSink | undefined;
+  private readonly changeReviewer: ChangeReviewer;
+  /** Baselines are captured before Kiro's built-in tools can touch disk. */
+  private readonly turnBaselines = new Map<string, FileSnapshot>();
+  private readonly directFileChanges = new Map<string, DirectFileChange>();
+  private readonly observedWriteTools = new Set<string>();
+  /** A write routed through the ACP fs callback must not be reviewed twice. */
+  private readonly clientReviewedPaths = new Set<string>();
+  private turnCancelled = false;
+  private turnReadOnly = false;
 
   constructor(
     private readonly output: vscode.OutputChannel,
     private readonly events: SessionEvents
-  ) {}
+  ) {
+    this.changeReviewer = new ChangeReviewer(output);
+  }
 
   get currentStatus(): SessionStatus {
     return this.status;
@@ -165,14 +199,42 @@ export class KiroSession {
   }
 
   /**
-   * Where Kiro runs, and the boundary every file read and write is checked
-   * against. With no folder open we fall back to the home directory rather
+   * Where Kiro runs. In a multi-root window the first folder remains its cwd,
+   * but file access is allowed inside every folder the user opened.
+   * With no folder open we fall back to the home directory rather
    * than process.cwd(), which for the extension host is wherever VS Code
    * itself was started — on Windows usually its own install folder.
    * `process.env.HOME` is no good here: Windows does not set it.
    */
   private workspaceRoot(): string {
-    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? os.homedir();
+    return this.workspaceRoots()[0];
+  }
+
+  private workspaceRoots(): string[] {
+    const roots = (vscode.workspace.workspaceFolders ?? []).map((folder) => folder.uri.fsPath);
+    return roots.length > 0 ? roots : [os.homedir()];
+  }
+
+  private isInside(root: string, full: string): boolean {
+    const relative = path.relative(root, full);
+    return (
+      relative === "" ||
+      (relative !== ".." &&
+        !relative.startsWith(`..${path.sep}`) &&
+        !path.isAbsolute(relative))
+    );
+  }
+
+  private displayPath(full: string): string {
+    const folders = vscode.workspace.workspaceFolders ?? [];
+    for (const folder of folders) {
+      const root = folder.uri.fsPath;
+      if (!this.isInside(root, full)) continue;
+      const relative = path.relative(root, full) || path.basename(full);
+      if (folders.length === 1) return relative;
+      return path.join(folder.name || path.basename(root), relative);
+    }
+    return path.basename(full);
   }
 
   async ensureReady(): Promise<void> {
@@ -292,7 +354,7 @@ export class KiroSession {
     }
   }
 
-  async send(blocks: ContentBlock[]): Promise<void> {
+  async send(blocks: ContentBlock[], options: SendOptions = {}): Promise<void> {
     await this.ensureReady();
     if (!this.client || !this.sessionId) return;
 
@@ -301,6 +363,8 @@ export class KiroSession {
       this.events.onError("This version of Kiro cannot take images, so they were left out.");
     }
 
+    this.turnReadOnly = options.readOnly === true;
+    this.beginTurnFileCapture(usable);
     this.setStatus("busy");
     try {
       // Kiro's docs call this field `content`; the ACP spec calls it `prompt`.
@@ -309,15 +373,20 @@ export class KiroSession {
         prompt: usable,
         content: usable,
       });
+      await this.finishDirectFileReviews();
       // A sink means someone else asked and is showing the answer; the panel
       // must not also declare the turn over, and the error belongs to the
       // caller rather than to the transcript.
       if (!this.sink) this.events.onTurnEnd(result?.stopReason);
     } catch (err) {
+      // An edit can succeed before a later tool fails. It still needs to be
+      // restored and reviewed instead of being left behind silently.
+      await this.finishDirectFileReviews();
       if (this.sink) throw err;
       this.events.onError(err instanceof Error ? err.message : String(err));
       this.events.onTurnEnd("error");
     } finally {
+      this.turnReadOnly = false;
       if (this.status === "busy") this.setStatus("ready");
     }
   }
@@ -384,12 +453,16 @@ export class KiroSession {
   }
 
   cancel(): void {
+    this.turnCancelled = true;
+    this.changeReviewer.cancelPending();
     if (this.client?.isRunning && this.sessionId) {
       this.client.notify("session/cancel", { sessionId: this.sessionId });
     }
   }
 
   async newSession(): Promise<void> {
+    this.turnCancelled = true;
+    this.changeReviewer.cancelPending();
     this.sessionId = undefined;
     this.client?.stop();
     this.client = undefined;
@@ -400,6 +473,7 @@ export class KiroSession {
   }
 
   dispose(): void {
+    this.changeReviewer.dispose();
     this.client?.stop();
     this.client = undefined;
     this.sessionId = undefined;
@@ -543,6 +617,7 @@ export class KiroSession {
       }
       case "tool_call":
       case "tool_call_update": {
+        this.observeDirectFileWrite(update);
         const tool = {
           id: String(update.toolCallId ?? update.id ?? Math.random()),
           title: String(update.title ?? update.rawInput?.command ?? update.kind ?? "tool"),
@@ -583,13 +658,9 @@ export class KiroSession {
   }
 
   private resolveInsideWorkspace(target: string): string {
-    const root = this.workspaceRoot();
-    const full = path.resolve(root, target);
-    const relative = path.relative(root, full);
-    if (relative.startsWith("..") || path.isAbsolute(relative)) {
-      throw new Error(`Path is outside the open folder: ${target}`);
-    }
-    return full;
+    const full = path.resolve(this.workspaceRoot(), target);
+    if (this.workspaceRoots().some((root) => this.isInside(root, full))) return full;
+    throw new Error(`Path is outside the open folders: ${target}`);
   }
 
   private async readFile(params: any): Promise<string> {
@@ -604,6 +675,9 @@ export class KiroSession {
   }
 
   private async writeFile(params: any): Promise<void> {
+    if (this.turnReadOnly) {
+      throw new Error("Plan mode is read-only. The proposed file edit was not applied.");
+    }
     const allowWrites = vscode.workspace
       .getConfiguration("kiroChat")
       .get<boolean>("allowFileWrites", true);
@@ -611,8 +685,297 @@ export class KiroSession {
       throw new Error("File writing is turned off in Kiro Chat settings.");
     }
     const full = this.resolveInsideWorkspace(String(params?.path ?? ""));
+    this.clientReviewedPaths.add(this.pathKey(full));
+    const proposed = String(params?.content ?? "");
+    const before = await this.readExistingFile(full);
+
+    // Do not interrupt the turn for a write that would change nothing.
+    if (before.exists && before.content === proposed) return;
+
+    let approved = proposed;
+    const reviewWrites = vscode.workspace
+      .getConfiguration("kiroChat")
+      .get<boolean>("reviewFileWrites", true);
+    if (reviewWrites) {
+      const relative = this.displayPath(full);
+      const decision = await this.changeReviewer.review({
+        path: relative,
+        before: before.content,
+        after: proposed,
+        creating: !before.exists,
+        applyContent: this.createReviewApplier(full, before),
+      });
+      if (!decision.accepted) {
+        throw new Error(`Changes to ${relative} were rejected by the user.`);
+      }
+      approved = decision.content;
+
+      // A review may be open for a while. Never overwrite typing, formatting,
+      // or another tool's write that happened after the diff was calculated.
+      const current = await this.readExistingFile(full);
+      // Per-hunk acceptance writes through immediately. If the reviewer has
+      // already produced the final content, there is nothing left to apply.
+      if (current.exists && current.content === approved) return;
+      if (current.exists !== before.exists || current.content !== before.content) {
+        throw new Error(
+          `${relative} changed while its review was open. The approved changes were not applied.`
+        );
+      }
+    }
+
+    if (before.exists && before.content === approved) return;
     await fs.mkdir(path.dirname(full), { recursive: true });
-    await fs.writeFile(full, String(params?.content ?? ""), "utf8");
+    await fs.writeFile(full, approved, "utf8");
+  }
+
+  private async readExistingFile(
+    full: string
+  ): Promise<{ exists: boolean; content: string }> {
+    try {
+      return { exists: true, content: await fs.readFile(full, "utf8") };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return { exists: false, content: "" };
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * Apply accepted hunks as soon as their CodeLens action is clicked. Every
+   * write is conditional on the exact state produced by the previous action,
+   * so typing or another tool touching the file aborts instead of being lost.
+   */
+  private createReviewApplier(
+    full: string,
+    before: { exists: boolean; content: string }
+  ): (content: string, exists: boolean) => Promise<void> {
+    let expected = { ...before };
+    return async (content, exists) => {
+      const current = await this.readExistingFile(full);
+      if (current.exists !== expected.exists || current.content !== expected.content) {
+        throw new Error("The file changed outside the review.");
+      }
+
+      if (exists) {
+        await fs.mkdir(path.dirname(full), { recursive: true });
+        await fs.writeFile(full, content, "utf8");
+        expected = { exists: true, content };
+        return;
+      }
+
+      try {
+        await fs.unlink(full);
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+      }
+      expected = { exists: false, content: "" };
+    };
+  }
+
+  /**
+   * Kiro CLI 2.21 performs its built-in FileWrite tools itself, even though
+   * this ACP client advertises fs/write_text_file. Snapshot attached files at
+   * the start of the turn, then add any other path as soon as its tool call is
+   * announced. This gives the review flow the real pre-edit content.
+   */
+  private beginTurnFileCapture(blocks: ContentBlock[]): void {
+    this.turnBaselines.clear();
+    this.directFileChanges.clear();
+    this.observedWriteTools.clear();
+    this.clientReviewedPaths.clear();
+    this.turnCancelled = false;
+
+    for (const block of blocks) {
+      if (block.type !== "resource_link") continue;
+      try {
+        const uri = vscode.Uri.parse(block.uri);
+        if (uri.scheme !== "file") continue;
+        const full = this.resolveInsideWorkspace(uri.fsPath);
+        this.captureBaseline(full);
+      } catch {
+        // A resource outside the workspace is never writable through this
+        // extension and does not belong in the turn's change set.
+      }
+    }
+  }
+
+  private pathKey(full: string): string {
+    const normal = path.normalize(full);
+    return process.platform === "win32" ? normal.toLowerCase() : normal;
+  }
+
+  private snapshotSync(full: string): FileSnapshot {
+    try {
+      return { full, exists: true, content: fsSync.readFileSync(full, "utf8") };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return { full, exists: false, content: "" };
+      }
+      throw err;
+    }
+  }
+
+  private captureBaseline(full: string): FileSnapshot {
+    const key = this.pathKey(full);
+    const saved = this.turnBaselines.get(key);
+    if (saved) return saved;
+    const snapshot = this.snapshotSync(full);
+    this.turnBaselines.set(key, snapshot);
+    return snapshot;
+  }
+
+  /** Record the path and expected content from a built-in edit tool update. */
+  private observeDirectFileWrite(update: any): void {
+    const raw = update?.rawInput ?? update?.input ?? update?.toolCall?.rawInput;
+    const title = String(update?.title ?? update?.toolCall?.title ?? "").toLowerCase();
+    const toolKind = normaliseKind(update?.kind ?? update?.toolCall?.kind);
+    const command = String(raw?.command ?? raw?.mode ?? "").toLowerCase();
+    const writeLike =
+      toolKind === "edit" ||
+      toolKind === "write" ||
+      title.startsWith("editing ") ||
+      title.startsWith("writing ") ||
+      ["strreplace", "replace", "write", "create", "overwrite"].includes(command);
+    if (!writeLike) return;
+
+    const target = raw?.path ?? raw?.filePath ?? raw?.file_path;
+    if (typeof target !== "string" || !target) return;
+
+    let full: string;
+    try {
+      full = this.resolveInsideWorkspace(target);
+    } catch (err) {
+      this.output.appendLine(
+        `Ignored a write tool outside the workspace: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      return;
+    }
+
+    const toolId = String(update?.toolCallId ?? update?.id ?? "");
+    if (toolId && this.observedWriteTools.has(toolId)) return;
+
+    const key = this.pathKey(full);
+    const before = this.captureBaseline(full);
+    const tracked = this.directFileChanges.get(key) ?? { before };
+    const base = tracked.expected ?? before.content;
+    const expected = this.expectedToolResult(base, raw);
+    if (expected !== undefined) tracked.expected = expected;
+    this.directFileChanges.set(key, tracked);
+    this.output.appendLine(`Captured Kiro's built-in write to ${this.displayPath(full)}.`);
+    if (toolId && raw) this.observedWriteTools.add(toolId);
+  }
+
+  private expectedToolResult(base: string, raw: any): string | undefined {
+    const command = String(raw?.command ?? raw?.mode ?? "").toLowerCase();
+    if (["strreplace", "replace"].includes(command)) {
+      const oldText = raw?.oldStr ?? raw?.old_string ?? raw?.oldText;
+      const newText = raw?.newStr ?? raw?.new_string ?? raw?.newText;
+      if (typeof oldText !== "string" || typeof newText !== "string" || !base.includes(oldText)) {
+        return undefined;
+      }
+      return raw?.replaceAll ? base.split(oldText).join(newText) : base.replace(oldText, newText);
+    }
+
+    const content = raw?.content ?? raw?.newContent ?? raw?.new_content;
+    if (["write", "create", "overwrite"].includes(command) && typeof content === "string") {
+      return content;
+    }
+    return undefined;
+  }
+
+  /**
+   * Put Kiro's direct writes back to their pre-turn state, then feed the final
+   * versions through the same selectable reviewer as an ACP callback write.
+   */
+  private async finishDirectFileReviews(): Promise<void> {
+    if (this.directFileChanges.size === 0) return;
+    const changes = [...this.directFileChanges.entries()];
+    this.directFileChanges.clear();
+
+    const config = vscode.workspace.getConfiguration("kiroChat");
+    const writesEnabled = config.get<boolean>("allowFileWrites", true);
+    const allowWrites = writesEnabled && !this.turnReadOnly;
+    const reviewWrites = config.get<boolean>("reviewFileWrites", true);
+
+    for (const [key, tracked] of changes) {
+      if (this.clientReviewedPaths.has(key)) continue;
+      const current = await this.readExistingFile(tracked.before.full);
+      if (
+        current.exists === tracked.before.exists &&
+        current.content === tracked.before.content
+      ) {
+        continue;
+      }
+
+      const relative = this.displayPath(tracked.before.full);
+      if (tracked.expected !== undefined && current.content !== tracked.expected) {
+        const message =
+          `${relative} no longer matches Kiro's proposed edit, so it was left untouched ` +
+          "instead of risking another change made during the turn.";
+        this.output.appendLine(message);
+        this.events.onError(message);
+        continue;
+      }
+
+      if (!reviewWrites && allowWrites && !this.turnCancelled) continue;
+      await this.restoreSnapshot(tracked.before);
+
+      if (this.turnCancelled) {
+        this.output.appendLine(`Reverted Kiro's cancelled change to ${relative}.`);
+        continue;
+      }
+      if (!allowWrites) {
+        const message = this.turnReadOnly
+          ? `Kiro tried to edit ${relative} in Plan mode. The edit was reverted.`
+          : `Kiro tried to edit ${relative}, but file writing is turned off. The edit was reverted.`;
+        this.output.appendLine(message);
+        this.events.onError(message);
+        continue;
+      }
+
+      const decision = await this.changeReviewer.review({
+        path: relative,
+        before: tracked.before.content,
+        after: current.content,
+        creating: !tracked.before.exists,
+        applyContent: this.createReviewApplier(tracked.before.full, {
+          exists: tracked.before.exists,
+          content: tracked.before.content,
+        }),
+      });
+      if (!decision.accepted) {
+        this.output.appendLine(`Kept the original ${relative}.`);
+        continue;
+      }
+
+      const now = await this.readExistingFile(tracked.before.full);
+      if (now.exists && now.content === decision.content) continue;
+      if (now.exists !== tracked.before.exists || now.content !== tracked.before.content) {
+        const message = `${relative} changed while its review was open. The approved lines were not applied.`;
+        this.output.appendLine(message);
+        this.events.onError(message);
+        continue;
+      }
+      if (tracked.before.exists && decision.content === tracked.before.content) continue;
+      await fs.mkdir(path.dirname(tracked.before.full), { recursive: true });
+      await fs.writeFile(tracked.before.full, decision.content, "utf8");
+    }
+  }
+
+  private async restoreSnapshot(snapshot: FileSnapshot): Promise<void> {
+    if (snapshot.exists) {
+      await fs.mkdir(path.dirname(snapshot.full), { recursive: true });
+      await fs.writeFile(snapshot.full, snapshot.content, "utf8");
+      return;
+    }
+    try {
+      await fs.unlink(snapshot.full);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") throw err;
+    }
   }
 
   private async askPermission(params: any): Promise<any> {
@@ -629,16 +992,30 @@ export class KiroSession {
       return { outcome: { outcome: "selected", optionId: allow.optionId ?? allow.id } };
     }
 
-    const title = params?.toolCall?.title ?? params?.toolCall?.kind ?? "run a tool";
-    const labels = options.map((o) => String(o.name ?? o.optionId ?? o.id));
-    const picked = await vscode.window.showInformationMessage(
-      `Kiro wants to ${title}.`,
-      { modal: true },
-      ...labels
-    );
+    const title = String(params?.toolCall?.title ?? params?.toolCall?.kind ?? "run a tool");
+    const choices = options.map((option) => ({
+      id: String(option.optionId ?? option.id),
+      label: String(option.name ?? option.optionId ?? option.id),
+      kind: String(option.kind ?? ""),
+    }));
+    let pickedId: string | undefined;
+    if (this.events.onPermission) {
+      pickedId = await this.events.onPermission({ title, options: choices });
+    } else {
+      // The chat view normally owns this interaction. Keep a non-modal
+      // fallback for callers that run Kiro without resolving the panel.
+      const label = await vscode.window.showInformationMessage(
+        `Kiro wants to ${title}.`,
+        ...choices.map((choice) => choice.label)
+      );
+      pickedId = choices.find((choice) => choice.label === label)?.id;
+    }
 
-    if (!picked) return { outcome: { outcome: "cancelled" } };
-    const chosen = options[labels.indexOf(picked)];
+    if (!pickedId) return { outcome: { outcome: "cancelled" } };
+    const chosen = options.find(
+      (option) => String(option.optionId ?? option.id) === pickedId
+    );
+    if (!chosen) return { outcome: { outcome: "cancelled" } };
     return { outcome: { outcome: "selected", optionId: chosen.optionId ?? chosen.id } };
   }
 }

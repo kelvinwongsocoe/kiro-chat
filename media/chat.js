@@ -13,6 +13,9 @@
   const chipsEl = el("chips");
   const attachBtn = el("attach");
   const attachMenu = el("attach-menu");
+  const modeBtn = el("mode-btn");
+  const modeLabel = el("mode-label");
+  const modeMenu = el("mode-menu");
   const modelBtn = el("model-btn");
   const modelLabel = el("model-label");
   const modelMenu = el("model-menu");
@@ -26,6 +29,26 @@
   let buffer = "";
   let models = [];
   let currentModelId = "";
+  const CHAT_MODES = [
+    { id: "default", label: "Default", description: "General coding assistance" },
+    { id: "spec", label: "Spec", description: "Structured feature development" },
+    {
+      id: "quick-spec",
+      label: "Quick Spec",
+      description: "Clarify, then generate requirements, design, and tasks",
+    },
+    {
+      id: "bug-fix",
+      label: "Bug Fix",
+      description: "Investigate, diagnose, and resolve bugs",
+    },
+    {
+      id: "plan",
+      label: "Plan",
+      description: "Plan the implementation without making changes",
+    },
+  ];
+  let currentModeId = "default";
   let attachments = [];
   let selection = null;
   let includeSelection = true;
@@ -47,7 +70,11 @@
 
   function saveState() {
     try {
-      vscode.setState({ history: history.slice(-MAX_HISTORY), includeSelection });
+      vscode.setState({
+        history: history.slice(-MAX_HISTORY),
+        includeSelection,
+        mode: currentModeId,
+      });
     } catch (err) {
       // State is a convenience. Never let it break the panel.
     }
@@ -67,6 +94,8 @@
       text: message.text || "",
       attachments: message.attachments || [],
       selection: message.selection,
+      mode: message.mode,
+      modeLabel: message.modeLabel,
     });
     saveState();
   }
@@ -238,6 +267,9 @@
       if (!a.preview) tags.push(`${iconFor(a.kind)} ${a.label}`);
     }
     if (message.selection) tags.push(`\u2317 ${message.selection}`);
+    if (message.mode && message.mode !== "default") {
+      tags.push(`\u25c7 ${message.modeLabel || message.mode}`);
+    }
 
     if (tags.length) {
       const meta = document.createElement("div");
@@ -266,6 +298,49 @@
     current = { root, tools, body, toolList: [] };
     buffer = "";
     return current;
+  }
+
+  function addPermissionCard(permission) {
+    const was = atBottom();
+    const bubble = ensureAgentBubble();
+    const card = document.createElement("section");
+    card.className = "permission-card";
+    card.dataset.requestId = permission.requestId;
+
+    const title = document.createElement("div");
+    title.className = "permission-title";
+    title.textContent = `Kiro wants to ${permission.title}.`;
+    card.appendChild(title);
+
+    const actions = document.createElement("div");
+    actions.className = "permission-actions";
+    const status = document.createElement("div");
+    status.className = "permission-status";
+
+    (permission.options || []).forEach((option, index) => {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "permission-option";
+      const kind = String(option.kind || "").toLowerCase();
+      if (kind.startsWith("allow") || index === 0) button.classList.add("primary");
+      if (kind.includes("reject") || kind.includes("deny")) button.classList.add("reject");
+      button.textContent = `${index + 1}  ${option.label}`;
+      button.addEventListener("click", () => {
+        for (const other of actions.querySelectorAll("button")) other.disabled = true;
+        button.classList.add("chosen");
+        status.textContent = `Selected: ${option.label}`;
+        vscode.postMessage({
+          type: "permissionDecision",
+          requestId: permission.requestId,
+          optionId: option.id,
+        });
+      });
+      actions.appendChild(button);
+    });
+
+    card.append(actions, status);
+    bubble.tools.appendChild(card);
+    scroll(was);
   }
 
   let repaintQueued = false;
@@ -418,15 +493,63 @@
     renderModelMenu();
   }
 
+  function renderModeMenu() {
+    modeMenu.innerHTML = "";
+    for (const mode of CHAT_MODES) {
+      const row = document.createElement("button");
+      row.type = "button";
+      row.className = "mode-row";
+      row.setAttribute("role", "option");
+      row.setAttribute("aria-selected", mode.id === currentModeId ? "true" : "false");
+      if (mode.id === currentModeId) row.classList.add("selected");
+      row.dataset.modeId = mode.id;
+
+      const name = document.createElement("div");
+      name.className = "mode-name";
+      name.textContent = mode.label;
+      row.appendChild(name);
+
+      const desc = document.createElement("div");
+      desc.className = "mode-desc";
+      desc.textContent = mode.description;
+      row.appendChild(desc);
+      modeMenu.appendChild(row);
+    }
+  }
+
+  function setMode(modeId, persist = true) {
+    const mode = CHAT_MODES.find((candidate) => candidate.id === modeId) || CHAT_MODES[0];
+    currentModeId = mode.id;
+    modeLabel.textContent = mode.label;
+    modeBtn.title = `${mode.label}: ${mode.description}`;
+    renderModeMenu();
+    if (persist) saveState();
+  }
+
   function setMenu(menu, button, open) {
     menu.hidden = !open;
     button.setAttribute("aria-expanded", open ? "true" : "false");
   }
 
   function closeMenus() {
+    setMenu(modeMenu, modeBtn, false);
     setMenu(modelMenu, modelBtn, false);
     setMenu(attachMenu, attachBtn, false);
   }
+
+  modeBtn.addEventListener("click", () => {
+    const open = modeMenu.hidden;
+    closeMenus();
+    if (open) renderModeMenu();
+    setMenu(modeMenu, modeBtn, open);
+  });
+
+  modeMenu.addEventListener("click", (event) => {
+    const row = event.target.closest(".mode-row");
+    if (!row) return;
+    setMode(row.dataset.modeId);
+    setMenu(modeMenu, modeBtn, false);
+  });
 
   modelBtn.addEventListener("click", () => {
     const open = modelMenu.hidden;
@@ -727,6 +850,9 @@
     if (!modelBtn.contains(event.target) && !modelMenu.contains(event.target)) {
       setMenu(modelMenu, modelBtn, false);
     }
+    if (!modeBtn.contains(event.target) && !modeMenu.contains(event.target)) {
+      setMenu(modeMenu, modeBtn, false);
+    }
     if (!usageBar.contains(event.target) && !usagePanel.contains(event.target)) {
       setUsagePanel(false);
     }
@@ -882,6 +1008,7 @@
     // starting up points at a turn that does not exist.
     stopBtn.hidden = status !== "busy";
     modelBtn.disabled = busy;
+    modeBtn.disabled = busy;
   }
 
   /** Put "@src/app.ts" into the message at the caret, so the text refers to it. */
@@ -913,7 +1040,13 @@
     if (!text && attachments.length === 0) return;
     inputEl.value = "";
     resize();
-    vscode.postMessage({ type: "send", text, includeSelection, includeActiveFile });
+    vscode.postMessage({
+      type: "send",
+      text,
+      includeSelection,
+      includeActiveFile,
+      mode: currentModeId,
+    });
   }
 
   formEl.addEventListener("submit", (event) => {
@@ -987,6 +1120,7 @@
     inputEl.disabled = !on;
     sendBtn.disabled = !on;
     attachBtn.disabled = !on;
+    modeBtn.disabled = !on;
     formEl.classList.toggle("composer-locked", !on);
     inputEl.placeholder = on
       ? "Ask Kiro…"
@@ -1519,6 +1653,10 @@
         break;
       }
 
+      case "permission":
+        addPermissionCard(message.permission || {});
+        break;
+
       case "turnEnd":
         finishAgentBubble();
         break;
@@ -1636,6 +1774,13 @@
       return {};
     }
   })();
+
+  if (CHAT_MODES.some((mode) => mode.id === saved.mode)) {
+    currentModeId = saved.mode;
+  }
+  // Rendering restored state must not call saveState before the transcript
+  // below has itself been restored, or a panel move can overwrite it empty.
+  setMode(currentModeId, false);
 
   // True when a moved panel restored the user’s own toggle, so the setting
   // default must not overwrite it.

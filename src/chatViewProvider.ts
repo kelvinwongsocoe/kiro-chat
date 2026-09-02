@@ -27,6 +27,7 @@ import {
   titleFrom,
   upsertRecord,
 } from "./history";
+import { applyChatMode, chatMode } from "./chatModes";
 
 /** Past chats are kept here, across windows and restarts. */
 const HISTORY_KEY = "kiroChat.history";
@@ -62,6 +63,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private everConnected = false;
   private selection: SelectionContext | undefined;
   private selectionTimer: NodeJS.Timeout | undefined;
+  private readonly pendingPermissions = new Map<
+    string,
+    (optionId: string | undefined) => void
+  >();
 
   /** Watches for Kiro appearing and connects, so the user need not click. */
   private readonly setup: SetupWatcher;
@@ -104,6 +109,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         this.post({ type: "models", models, currentModelId }),
       onUsage: (usage) => this.post({ type: "usage", usage }),
       onCapabilities: (caps) => this.post({ type: "capabilities", caps }),
+      onPermission: (request) => this.requestPermissionInChat(request),
     });
 
     // Track where the user is working, so the chip stays current.
@@ -130,10 +136,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           await this.send(
             String(message.text ?? ""),
             Boolean(message.includeSelection),
-            message.includeActiveFile !== false
+            message.includeActiveFile !== false,
+            message.mode
           );
           break;
         case "stop":
+          this.cancelPendingPermissions();
           this.session.cancel();
           break;
         case "new":
@@ -207,6 +215,14 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         case "showLog":
           this.output.show(true);
           break;
+        case "permissionDecision": {
+          const requestId = String(message.requestId ?? "");
+          const resolve = this.pendingPermissions.get(requestId);
+          if (!resolve) break;
+          this.pendingPermissions.delete(requestId);
+          resolve(message.optionId === undefined ? undefined : String(message.optionId));
+          break;
+        }
         case "transcript":
           // The webview keeps the transcript already; this is it reporting in
           // after a turn so the same copy can outlive the panel.
@@ -227,6 +243,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
     view.onDidDispose(() => {
       this.view = undefined;
+      this.cancelPendingPermissions();
       // Nothing left to report progress to, and the poll would outlive the panel.
       this.setup.stop();
     });
@@ -455,6 +472,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     void this.view?.webview.postMessage(message);
   }
 
+  private requestPermissionInChat(request: {
+    title: string;
+    options: Array<{ id: string; label: string; kind: string }>;
+  }): Promise<string | undefined> {
+    if (!this.view) return Promise.resolve(undefined);
+    const requestId = freshId();
+    return new Promise((resolve) => {
+      this.pendingPermissions.set(requestId, resolve);
+      this.post({ type: "permission", permission: { requestId, ...request } });
+    });
+  }
+
+  private cancelPendingPermissions(): void {
+    for (const resolve of this.pendingPermissions.values()) resolve(undefined);
+    this.pendingPermissions.clear();
+  }
+
   /** The live Kiro session, shared with the @kiro chat participant so both
    *  boxes talk to one conversation rather than two agents. */
   get kiroSession(): KiroSession {
@@ -650,7 +684,8 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   async send(
     text: string,
     includeSelection: boolean,
-    includeActiveFile = true
+    includeActiveFile = true,
+    modeValue: unknown = "default"
   ): Promise<void> {
     const trimmed = text.trim();
     if (!trimmed && this.attachments.length === 0) return;
@@ -664,9 +699,12 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       includeActiveFile
     ) as Attachment[];
 
+    const mode = chatMode(modeValue);
     this.post({
       type: "userMessage",
       text: trimmed,
+      mode: mode.id,
+      modeLabel: mode.label,
       // The preview goes with the sent message too, so the transcript shows
       // the picture you sent rather than its filename.
       attachments: attached.map((a) => ({
@@ -680,13 +718,16 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           : undefined,
     });
 
-    const blocks = buildBlocks(trimmed, attached, this.selection, includeSelection);
+    const blocks = applyChatMode(
+      buildBlocks(trimmed, attached, this.selection, includeSelection),
+      mode
+    );
 
     this.attachments = [];
     this.postAttachments();
 
     this.everConnected = true;
-    await this.session.send(blocks);
+    await this.session.send(blocks, { readOnly: mode.readOnly === true });
   }
 
   async sendFromEditor(text: string): Promise<void> {
@@ -700,6 +741,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   async newSession(): Promise<void> {
+    this.cancelPendingPermissions();
     // Keep what is on screen before it is thrown away. This used to lose the
     // conversation outright.
     this.saveCurrentChat();
@@ -719,6 +761,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
   dispose(): void {
     if (this.selectionTimer) clearTimeout(this.selectionTimer);
+    this.cancelPendingPermissions();
     for (const w of this.watchers) w.dispose();
     this.setup.stop();
     this.session.dispose();
@@ -882,6 +925,13 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           <button type="button" data-act="attachFolders">A folder</button>
           <button type="button" data-act="attachImage">An image</button>
         </div>
+      </div>
+      <div class="mode-wrap">
+        <button type="button" id="mode-btn" class="mode-btn" aria-haspopup="listbox" aria-expanded="false">
+          <span id="mode-label">Default</span>
+          <span class="caret">&#9662;</span>
+        </button>
+        <div id="mode-menu" class="mode-menu" hidden role="listbox"></div>
       </div>
       <div class="model-wrap">
         <button type="button" id="model-btn" class="model-btn" aria-haspopup="listbox" aria-expanded="false" disabled>

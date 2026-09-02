@@ -149,6 +149,21 @@ Two things worth knowing:
 - If the dropdown stays greyed out saying "Model: default", your version of Kiro isn't
   reporting a model list. Everything else still works; Kiro just uses its own default.
 
+## Choosing a workflow mode
+
+The mode dropdown beside the attachment and model controls changes how Kiro approaches the
+next request:
+
+- **Default** — general coding assistance.
+- **Spec** — structured requirements, design, tasks, and implementation.
+- **Quick Spec** — clarify only blockers, then generate a concise spec and proceed.
+- **Bug Fix** — investigate, diagnose the root cause, make a focused fix, and verify it.
+- **Plan** — analyze and return an implementation plan without changing files.
+
+The choice survives panel moves and reloads and is shown on the sent message. These workflows
+are explicit request instructions layered over Kiro's ACP session. Plan also has a hard safety
+boundary in the extension: callback writes are refused and any direct Kiro write is restored.
+
 ## If it doesn't work
 
 Open the command palette (`Ctrl+Shift+P`) and run **Kiro Chat: Show Log**. It shows exactly
@@ -195,10 +210,20 @@ login you already have.
 
 ## Safety choices worth knowing
 
-- **Reading and writing files is limited to your open folder.** A path pointing outside
-  gets refused.
-- **Tools ask first.** You get a popup naming what Kiro wants to do before it happens.
-  There is a setting to auto-approve, off by default. Only turn it on in a folder you trust.
+- **Reading and writing files is limited to your open workspace folders.** This includes
+  every root in a multi-root workspace; a path outside all of them gets refused.
+- **Tools ask first inside the chat.** Kiro's permission choices appear as an inline card
+  in the current response instead of a separate popup. There is a setting to auto-approve,
+  off by default. Only turn it on in a folder you trust.
+- **File changes open for inline review before the turn finishes.** Deleted/original lines
+  are red and inserted/proposed lines are green in a source editor tab. Each changed section
+  has a blue **Review change N of M** marker plus numbered
+  **Accept change N of M / Reject change N of M** CodeLens actions; use `Alt+Enter` or
+  `Shift+Alt+Enter` with the cursor on a hunk. Whole-file actions remain at the top.
+  Accepted hunks are written immediately while rejected hunks collapse back to the original.
+  Kiro CLI's built-in edit tool writes directly, so the extension captures its
+  result, restores the pre-turn file when the turn ends, and leaves only the lines you approve.
+  Closing the tab rejects the write. This is on by default and can be disabled in settings.
 - **No terminal access.** The extension tells Kiro it cannot run shell commands, so Kiro
   will not try.
 - Text coming back from Kiro is escaped before it is shown, so a reply cannot inject
@@ -215,6 +240,7 @@ All optional.
 | `kiroChat.env` | Extra environment variables for Kiro. |
 | `kiroChat.allowFileWrites` | Let Kiro edit files. Turn off for read-only chat. |
 | `kiroChat.autoApproveTools` | Skip the approval popup. Off by default. |
+| `kiroChat.reviewFileWrites` | Inline red/green review with whole-file and per-hunk decisions. On by default. |
 | `kiroChat.sendSelection` | Send highlighted code with each message. |
 | `kiroChat.model` | The model to use. The dropdown sets this for you. |
 

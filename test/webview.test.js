@@ -15,6 +15,33 @@ test("chat.js is valid JavaScript", () => {
   assert.doesNotThrow(() => new vm.Script(js, { filename: "chat.js" }));
 });
 
+test("the composer offers and persists all requested workflow modes", () => {
+  for (const label of ["Default", "Spec", "Quick Spec", "Bug Fix", "Plan"]) {
+    assert.match(js, new RegExp(`label: "${label}"`));
+  }
+  assert.match(provider, /id="mode-btn"/);
+  assert.match(provider, /id="mode-menu"/);
+  assert.match(js, /mode: currentModeId/, "the selected mode must go with each request");
+  assert.match(js, /mode: currentModeId[\s\S]*vscode\.setState|vscode\.setState\([\s\S]*mode: currentModeId/);
+  assert.match(js, /setMode\(currentModeId, false\)/, "restoring a mode must not erase history");
+  assert.match(css, /^\.mode-row \{/m);
+});
+
+test("tool permission choices are shown inside the chat instead of a modal", () => {
+  const session = fs.readFileSync(path.join(root, "src", "kiroSession.ts"), "utf8");
+  const permission = session.slice(session.indexOf("private async askPermission"));
+  assert.match(provider, /onPermission:/, "the provider must own permission interaction");
+  assert.match(provider, /permissionDecision/, "the chat must return the chosen option");
+  assert.match(js, /case "permission"/, "the webview must render permission requests");
+  assert.match(js, /permission-card/, "permission choices need an inline card");
+  assert.match(css, /^\.permission-card \{/m, "the inline permission card needs a style");
+  assert.doesNotMatch(
+    permission.slice(0, 1800),
+    /modal:\s*true/,
+    "permission requests must not open a modal popup"
+  );
+});
+
 /**
  * The panel toggles four elements with the hidden attribute. Every one of them
  * also has an author rule setting display, and an author rule beats the

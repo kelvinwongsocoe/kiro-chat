@@ -2,7 +2,7 @@
   "name": "kiro-chat",
   "displayName": "Kiro Chat",
   "description": "Chat with the Kiro agent inside VS Code, like Copilot Chat.",
-  "version": "0.5.4",
+  "version": "0.10.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -142,6 +142,16 @@
       {
         "command": "kiroChat.focus",
         "key": "ctrl+alt+k"
+      },
+      {
+        "command": "kiroChat.review.acceptAtCursor",
+        "key": "alt+enter",
+        "when": "editorTextFocus && resourceScheme == kiro-change-review && kiroChat.hunkReviewActive"
+      },
+      {
+        "command": "kiroChat.review.rejectAtCursor",
+        "key": "shift+alt+enter",
+        "when": "editorTextFocus && resourceScheme == kiro-change-review && kiroChat.hunkReviewActive"
       }
     ],
     "configuration": {
@@ -169,6 +179,11 @@
           "type": "boolean",
           "default": false,
           "description": "Approve every tool Kiro asks to run without asking you first. Leave this off unless you trust the workspace."
+        },
+        "kiroChat.reviewFileWrites": {
+          "type": "boolean",
+          "default": true,
+          "description": "Open an inline editor review for Kiro's proposed changes, with red/green highlights, per-hunk CodeLens actions, and keyboard shortcuts."
         },
         "kiroChat.command": {
           "type": "string",

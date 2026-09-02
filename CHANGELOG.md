@@ -1,5 +1,79 @@
 # Changelog
 
+## 0.10.0
+
+- Review hunks now carry a theme-aware blue **Review change N of M** badge, and the
+  CodeLens actions use stronger bracketed **Accept / Reject** labels with their shortcuts.
+- The composer now offers **Default, Spec, Quick Spec, Bug Fix, and Plan** modes, including
+  a description for each mode and persistence when the panel moves or reloads.
+- The selected workflow is applied to every request. **Plan** is enforced as read-only:
+  callback writes are refused and direct Kiro writes are restored automatically.
+
+## 0.9.1
+
+- **Nearby edits no longer collapse into one file-sized review action.** Every contiguous
+  changed block is now its own selectable hunk, even when only one unchanged line separates
+  it from the next edit.
+- Per-hunk CodeLens actions are numbered, for example **Accept change 2 of 4**, so their
+  exact scope is clear and distinct from the whole-file controls at the top.
+
+## 0.9.0
+
+- **Reviews now render directly in a source editor tab.** Original lines have a red
+  background and proposed lines have a green background, using the active VS Code theme's
+  diff colours.
+- Every pending hunk has prominent CodeLens actions for **Accept this change** and
+  **Reject this change**. `Alt+Enter` accepts the hunk under the cursor and
+  `Shift+Alt+Enter` rejects it.
+- Accepting writes that hunk immediately, removes its original red lines, and clears its
+  decorations. Rejecting removes its proposed green lines and restores the original block.
+  External file changes still abort the review instead of being overwritten.
+
+## 0.8.0
+
+- **Changed sections can now be accepted or rejected independently with obvious buttons.**
+  The review opens as an editor tab with a separate diff card for every hunk and large
+  **Accept this change / Reject this change** controls beside it.
+- **Accept entire file / Reject entire file** remain available in a sticky toolbar, and
+  progress shows how many changed sections are left to review. Closing the tab safely
+  rejects the proposal.
+
+## 0.7.0
+
+- **Tool approval now happens inside the Kiro chat.** Permission requests render as an
+  inline card with Kiro's available choices instead of opening a modal VS Code popup.
+- **Change review now uses VS Code's native diff editor.** The proposed side shows
+  **Accept File / Reject File** actions and **Accept Hunk / Reject Hunk** actions directly
+  above each changed section. The separate line-checkbox review page has been removed.
+- Closing the native diff still rejects undecided changes, and reviews remain serialised
+  when Kiro edits several files.
+
+## 0.6.2
+
+- **Change review now works in multi-root workspaces.** Version 0.6.1 checked edits
+  against only the first workspace folder, so a file in another open root was mistaken
+  for an outside-workspace path and skipped. All open roots are now accepted while paths
+  outside every root remain blocked.
+
+## 0.6.1
+
+- **Review now catches Kiro CLI 2.21's real edit path.** Kiro's built-in `FileWrite`
+  tool edits the workspace directly instead of calling the ACP `fs/write_text_file`
+  callback. The extension now captures those tools too, restores each file to its
+  pre-turn contents, and opens the same file/hunk/line review before unlocking chat.
+- Cancelling a turn restores any direct edits it already made. With file writing turned
+  off, direct Kiro edits are also restored instead of bypassing the read-only setting.
+
+## 0.6.0
+
+- **Review Kiro's edits before they touch disk.** Every proposed file write now opens a
+  diff with Apply and Reject controls. Changed lines are checked individually, each diff
+  hunk has a master checkbox, and you can still apply or reject the whole file at once.
+- Closing a review rejects the write. If the file changes in the editor while its review
+  is open, the extension refuses to overwrite the newer version.
+- Review is on by default. Turn off `kiroChat.reviewFileWrites` to keep the earlier
+  immediate-write behaviour, or turn off `kiroChat.allowFileWrites` for read-only chat.
+
 ## 0.5.4
 
 - **The drop area is the whole panel, and now looks like it.** It always was — the
