@@ -73,8 +73,18 @@ body {
   padding: var(--gap);
   display: flex;
   flex-direction: column;
-  /* Turns need more air than the old bubbles did to read as separate. */
-  gap: 18px;
+  /* Between a question and its own answer. */
+  gap: 14px;
+}
+
+/*
+ * The gap between one exchange and the next is bigger than the gap inside
+ * one, so a long conversation reads as a stack of exchanges rather than an
+ * undifferentiated column. Every user message starts a new exchange, except
+ * the first, which has nothing above it to be separated from.
+ */
+.msg.user:not(:first-child) {
+  margin-top: 16px;
 }
 
 .empty {
@@ -112,8 +122,41 @@ body {
   opacity: 0.8;
 }
 
+/*
+ * What you asked, as a block of its own.
+ *
+ * Both turns used to be plain full-width prose separated only by a 10px
+ * uppercase label, and the question was painted in the *muted* colour — so
+ * your own words were the faintest thing on screen and scrolling back through
+ * a long chat gave the eye nothing to catch on. The question now sits on its
+ * own quiet surface at full contrast; the answer stays plain prose, which is
+ * what long text wants in a narrow column.
+ */
+/*
+ * Sized to what was typed and pushed to the right.
+ *
+ * A one-line question stretched across the full width read as another
+ * paragraph of the conversation rather than as the thing that started it.
+ * `width: fit-content` lets a short question stay short; the max keeps a long
+ * one from becoming a narrow column of wrapped text, and it still gives way
+ * to the answer, which is what the eye should return to.
+ */
 .msg.user {
-  color: var(--vscode-descriptionForeground);
+  align-self: flex-end;
+  width: fit-content;
+  /*
+   * Never the whole width. A bubble that reaches both margins is just a
+   * paragraph again; leaving a strip of ground down its left is what says
+   * somebody sent it. Long questions still get almost all of the room.
+   */
+  max-width: 88%;
+  padding: 9px 12px;
+  border-radius: var(--radius);
+  background: var(--vscode-textBlockQuote-background, rgba(127, 127, 127, 0.09));
+  color: var(--vscode-foreground);
+}
+
+.user-text {
   white-space: pre-wrap;
 }
 
@@ -166,12 +209,28 @@ body {
   background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.15));
 }
 
-.msg pre {
+/* Positions the copy button over the code without shifting it. */
+.code-block {
+  position: relative;
   margin: 0 0 0.7em;
-  padding: 9px 11px;
+}
+
+/*
+ * The editor's own background, not the panel's.
+ *
+ * `textCodeBlock-background` is a faint wash designed to sit inside prose,
+ * and against the sidebar's ground it was very nearly invisible — the block
+ * read as more paragraph. Taking `editor-background` makes it the colour the
+ * code would have in a tab: clearly darker than the sidebar on a dark theme,
+ * clearly lighter on a light one, and right in both without hard-coding
+ * black.
+ */
+.msg pre {
+  margin: 0;
+  padding: 10px 12px;
   overflow-x: auto;
   border-radius: var(--radius);
-  background: var(--vscode-textCodeBlock-background, rgba(127, 127, 127, 0.12));
+  background: var(--vscode-editor-background, rgba(0, 0, 0, 0.28));
   border: 1px solid var(--vscode-panel-border);
 }
 
@@ -179,6 +238,229 @@ body {
   padding: 0;
   background: none;
   white-space: pre;
+}
+
+/*
+ * Token colours taken from the active theme.
+ *
+ * VS Code does not hand a webview the editor's TextMate token colours, so an
+ * exact match with the editor is not available. These are the theme's own
+ * colour keys for the same ideas — the string colour it uses in the debugger,
+ * the keyword colour it uses on symbol icons — so the block follows whatever
+ * theme is running instead of a fixed palette fighting it. The fallbacks are
+ * only for a theme that leaves a key undefined.
+ */
+.tok-comment {
+  color: var(--vscode-editorCodeLens-foreground, var(--vscode-descriptionForeground));
+  font-style: italic;
+}
+
+.tok-string {
+  color: var(--vscode-debugTokenExpression-string, #ce9178);
+}
+
+.tok-number {
+  color: var(--vscode-debugTokenExpression-number, #b5cea8);
+}
+
+.tok-const {
+  color: var(--vscode-debugTokenExpression-boolean, #569cd6);
+}
+
+.tok-keyword {
+  color: var(--vscode-symbolIcon-keywordForeground, #c586c0);
+}
+
+.tok-fn {
+  color: var(--vscode-symbolIcon-functionForeground, #dcdcaa);
+}
+
+/*
+ * The fallbacks above are dark-theme values, which would be unreadable on a
+ * light one. VS Code puts `vscode-light` on the webview's body, so the light
+ * fallbacks go here. The theme variable still wins wherever it is defined —
+ * only the fallback changes.
+ */
+body.vscode-light .tok-string,
+body.vscode-high-contrast-light .tok-string {
+  color: var(--vscode-debugTokenExpression-string, #a31515);
+}
+
+body.vscode-light .tok-number,
+body.vscode-high-contrast-light .tok-number {
+  color: var(--vscode-debugTokenExpression-number, #098658);
+}
+
+body.vscode-light .tok-const,
+body.vscode-high-contrast-light .tok-const {
+  color: var(--vscode-debugTokenExpression-boolean, #0000ff);
+}
+
+body.vscode-light .tok-keyword,
+body.vscode-high-contrast-light .tok-keyword {
+  color: var(--vscode-symbolIcon-keywordForeground, #af00db);
+}
+
+body.vscode-light .tok-fn,
+body.vscode-high-contrast-light .tok-fn {
+  color: var(--vscode-symbolIcon-functionForeground, #795e26);
+}
+
+/*
+ * Kept out of the way until the block is pointed at, because it sits over the
+ * first line of code. It has its own ground so it stays legible there, and it
+ * appears on keyboard focus as well — hover is not the only way in.
+ */
+.code-copy {
+  position: absolute;
+  top: 4px;
+  right: 4px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--vscode-descriptionForeground);
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity 120ms ease,
+    color 120ms ease,
+    background-color 120ms ease;
+}
+
+.code-block:hover .code-copy,
+.code-copy:focus-visible,
+.code-copy.copied {
+  opacity: 1;
+}
+
+/* Only on hover does it take a ground, so it never sits as a box on the code. */
+.code-copy:hover {
+  color: var(--vscode-foreground);
+  background: var(--vscode-toolbar-hoverBackground, rgba(127, 127, 127, 0.18));
+}
+
+.code-copy.copied {
+  color: var(--vscode-testing-iconPassed, #3fb950);
+}
+
+.code-copy:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.code-copy svg {
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+}
+
+/*
+ * The steps group: one line of state, with the detail folded behind it.
+ *
+ * A turn can run a dozen tools, and listing them all pushed the answer off
+ * the screen before it arrived. The header carries the elapsed time, which is
+ * the thing that tells a slow turn from a stuck one.
+ */
+.steps {
+  margin-bottom: 0.7em;
+}
+
+.steps-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 6px 3px 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--vscode-descriptionForeground);
+  font: inherit;
+  font-size: 0.88em;
+  text-align: left;
+  cursor: pointer;
+}
+
+.steps-head:hover {
+  background: none;
+  color: var(--vscode-foreground);
+}
+
+.steps-head:disabled {
+  cursor: default;
+}
+
+.steps-head:disabled:hover {
+  color: var(--vscode-descriptionForeground);
+}
+
+.steps-head:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
+}
+
+.steps-label {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The number that separates a slow turn from a stuck one. */
+.steps-time {
+  flex: 0 0 auto;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.85;
+}
+
+/*
+ * A chevron that turns when the list opens, and a spinner while the turn is
+ * running. One slot, so the header does not shift as the state changes.
+ */
+.steps-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+}
+
+.steps-icon::before {
+  content: "›";
+  display: inline-block;
+  font-size: 1.15em;
+  line-height: 1;
+  transition: transform 120ms ease;
+}
+
+.steps.open .steps-icon::before {
+  transform: rotate(90deg);
+}
+
+
+.steps.running .steps-icon::before {
+  content: "";
+  width: 10px;
+  height: 10px;
+  border: 1.5px solid var(--vscode-panel-border);
+  border-top-color: var(--vscode-progressBar-background, var(--vscode-focusBorder));
+  border-radius: 50%;
+  animation: tool-spin 720ms linear infinite;
+  transform: none;
+}
+
+.steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-top: 4px;
 }
 
 .tools {
@@ -189,14 +471,131 @@ body {
 }
 
 .tool {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
   font-size: 0.85em;
   color: var(--vscode-descriptionForeground);
-  padding-left: 14px;
+  padding-left: 12px;
   border-left: 2px solid var(--vscode-panel-border);
 }
 
+.tool-text {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.tool-title {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/*
+ * Kiro's own note on why it is running a step. This is what unfolding the
+ * list is for — the title says what, this says what for — so it wraps rather
+ * than being clipped to one line.
+ */
+.tool-purpose {
+  font-size: 0.92em;
+  line-height: 1.4;
+  opacity: 0.75;
+}
+
+/*
+ * A reserved slot rather than a mark.
+ *
+ * Only the step still running gets anything in it — the spinner — so the rows
+ * stay a plain list. It keeps its width when empty so a row does not shift
+ * sideways the moment its step finishes.
+ */
+.tool-icon {
+  flex: 0 0 auto;
+  width: 9px;
+  margin-top: 0.35em;
+  line-height: 1;
+}
+
+/* A failure is carried by the row's colour; it needs no glyph of its own. */
 .tool[data-status="failed"] {
   color: var(--vscode-errorForeground, #f14c4c);
+}
+
+/* A ring that turns, for a step that has not finished. */
+.tool-icon.spinning {
+  align-self: center;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid var(--vscode-panel-border);
+  border-top-color: var(--vscode-progressBar-background, var(--vscode-focusBorder));
+  border-radius: 50%;
+  animation: tool-spin 720ms linear infinite;
+}
+
+@keyframes tool-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/*
+ * "Kiro is working on it", where the answer will be.
+ *
+ * The status dot lives at the very top of the panel, nowhere near what the
+ * user is looking at, so between pressing Send and the first token the
+ * transcript said nothing and a slow turn looked like a dead one.
+ */
+.thinking {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.9em;
+  color: var(--vscode-descriptionForeground);
+}
+
+.thinking-dots {
+  display: inline-flex;
+  gap: 3px;
+}
+
+.thinking-dots i {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: currentColor;
+  opacity: 0.35;
+  animation: thinking-pulse 1.25s ease-in-out infinite;
+}
+
+.thinking-dots i:nth-child(2) {
+  animation-delay: 0.16s;
+}
+
+.thinking-dots i:nth-child(3) {
+  animation-delay: 0.32s;
+}
+
+@keyframes thinking-pulse {
+  30% {
+    opacity: 1;
+    transform: translateY(-2px);
+  }
+}
+
+/*
+ * Motion is decoration here — the words and the glyphs already carry the
+ * state — so it comes off entirely for anyone who asked for less of it.
+ */
+@media (prefers-reduced-motion: reduce) {
+  .tool-icon.spinning,
+  .thinking-dots i {
+    animation: none;
+  }
+  .thinking-dots i {
+    opacity: 0.7;
+  }
 }
 
 .permission-card {
@@ -283,10 +682,30 @@ textarea:focus {
   outline-offset: -1px;
 }
 
+/*
+ * One height for everything in the row.
+ *
+ * The controls were sized three different ways — the attach button by fixed
+ * pixels, the pickers by their own padding, Send by the global button padding
+ * — so nothing lined up. `--control-h` is the single number now; anything
+ * added to this row should take it too.
+ */
 .composer-row {
+  --control-h: 22px;
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: 5px;
+}
+
+/*
+ * `:is` rather than a list of paths to each control. The enumerated version
+ * only held the ones it happened to name, so a control moved into a new
+ * wrapper quietly dropped out of it and went back to sizing itself.
+ */
+.composer-row :is(.icon, .mode-btn, .model-btn) {
+  height: var(--control-h);
+  min-height: var(--control-h);
+  line-height: 1;
 }
 
 button {
@@ -510,11 +929,20 @@ button:disabled {
 }
 
 .msg-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 12px;
   margin-top: 5px;
   padding-top: 5px;
   border-top: 1px solid var(--vscode-panel-border);
   font-size: 0.8em;
   opacity: 0.75;
+}
+
+.msg-tag {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* --- attachment chips -------------------------------------------- */
@@ -525,30 +953,47 @@ button:disabled {
   gap: 5px;
 }
 
+/*
+ * Chips read as one quiet surface rather than a row of solid badges. The
+ * badge colours are meant for a count on a tab; at chip width they were a
+ * block of flat grey with no state of their own, so nothing in the row
+ * responded to the pointer and the × had only an opacity nudge to show it
+ * was live. This is a bordered surface that lifts on hover instead.
+ */
 .chip {
   display: inline-flex;
   align-items: center;
   max-width: 100%;
-  border-radius: 4px;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 5px;
   font-size: 0.83em;
-  background: var(--vscode-badge-background);
-  color: var(--vscode-badge-foreground);
+  background: var(--vscode-editorWidget-background, transparent);
+  color: var(--vscode-foreground);
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
 }
 
+/* Only the ones that do something on click say so. */
+.chip-open-able:hover {
+  border-color: var(--vscode-focusBorder);
+  background: var(--vscode-list-hoverBackground);
+}
+
+/*
+ * No × on this one: it reports the highlight rather than switching it off,
+ * so it is padded evenly instead of leaving room for a button.
+ */
 .chip-selection {
   gap: 6px;
-  padding: 2px 4px 2px 8px;
+  padding: 3px 9px;
+  border-color: var(--vscode-focusBorder);
 }
 
 .chip-selection > span:first-child {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.chip-count {
-  opacity: 0.7;
-  font-size: 0.9em;
 }
 
 .chip-muted {
@@ -572,35 +1017,86 @@ button:disabled {
   white-space: nowrap;
 }
 
-.chip-x {
-  padding: 2px 6px;
-  border: none;
+/* The chip itself carries the hover, so the label inside it stays plain. */
+.chip-open:hover {
   background: none;
-  color: inherit;
+}
+
+/*
+ * A real hit target. It used to be a bare glyph whose only hover state was an
+ * opacity nudge from 0.65 to 1 — no shape, no ground, nothing saying where
+ * the click lands or that it removes something.
+ */
+.chip-x {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  margin: 0 3px 0 1px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--vscode-descriptionForeground);
   font: inherit;
   line-height: 1;
   cursor: pointer;
-  opacity: 0.65;
+  transition:
+    background-color 120ms ease,
+    color 120ms ease;
 }
 
 .chip-x:hover {
-  opacity: 1;
+  background: var(--vscode-toolbar-hoverBackground, var(--vscode-list-hoverBackground));
+  color: var(--vscode-errorForeground);
+}
+
+.chip-x:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: -1px;
 }
 
 /* --- attach button and menus -------------------------------------- */
 
+/* Square, so the row reads as one set of controls rather than three. */
 .icon {
-  width: 26px;
-  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  width: var(--control-h, 22px);
   padding: 0;
-  font-size: 1.1em;
+  border-radius: 4px;
   line-height: 1;
   color: var(--vscode-button-secondaryForeground);
   background: var(--vscode-button-secondaryBackground);
 }
 
-.icon:hover {
+.icon svg {
+  width: 12px;
+  height: 12px;
+  fill: currentColor;
+}
+
+.icon:hover:not(:disabled) {
   background: var(--vscode-button-secondaryHoverBackground);
+}
+
+/* Send is the one thing in the row that carries the accent. */
+.icon.primary {
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-button-background);
+}
+
+.icon.primary:hover:not(:disabled) {
+  background: var(--vscode-button-hoverBackground);
+}
+
+.icon.danger:hover:not(:disabled) {
+  color: var(--vscode-button-foreground);
+  background: var(--vscode-errorForeground, #f14c4c);
 }
 
 .attach-wrap {
@@ -642,17 +1138,32 @@ button:disabled {
   min-width: 0;
 }
 
+/*
+ * The icon leads, the label follows. A chevron on the right said only "this
+ * opens" — which a click discovers anyway — while costing width in a panel
+ * that has none to spare and leaving the two pickers looking like a pair of
+ * form fields rather than part of the same row of controls.
+ */
 .mode-btn,
 .model-btn {
   display: flex;
   align-items: center;
   gap: 5px;
-  max-width: 200px;
-  padding: 3px 8px;
-  font-size: 0.87em;
+  max-width: 190px;
+  padding: 0 7px;
+  border-radius: 4px;
+  font-size: 0.82em;
   color: var(--vscode-dropdown-foreground);
   background: var(--vscode-dropdown-background);
   border: 1px solid var(--vscode-dropdown-border, var(--vscode-panel-border));
+}
+
+.btn-icon {
+  flex: 0 0 auto;
+  width: 11px;
+  height: 11px;
+  fill: currentColor;
+  opacity: 0.75;
 }
 
 .mode-btn:hover:not(:disabled),
@@ -1092,6 +1603,17 @@ button:disabled {
   cursor: pointer;
 }
 
+/*
+ * The row behind this button already lights up on hover, and that is the only
+ * effect wanted. Without an explicit hover the global `button:hover` rule wins
+ * — a type plus a pseudo-class outranks one class, so `background: none` above
+ * does not hold — and the whole clickable area painted solid button blue on
+ * top of the row's tint. The same trap as `.usage-bar` and `.change-summary`.
+ */
+.history-open:hover {
+  background: none;
+}
+
 .history-open:focus-visible {
   outline: 1px solid var(--vscode-focusBorder);
   outline-offset: -1px;
@@ -1226,11 +1748,11 @@ button:disabled {
  * Quieter than an attachment you chose yourself: it appears on its own, so it
  * should read as context rather than as something you did.
  */
+/* The automatic one is quieter than a file you attached on purpose. */
 .chip-active {
   gap: 6px;
   padding: 2px 4px 2px 8px;
   background: transparent;
-  border: 1px solid var(--vscode-panel-border);
   color: var(--vscode-descriptionForeground);
 }
 

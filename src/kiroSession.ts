@@ -53,7 +53,7 @@ export type ContentBlock =
 export interface TurnSink {
   onText: (text: string) => void;
   onThought?: (text: string) => void;
-  onTool?: (tool: { id: string; title: string; status: string }) => void;
+  onTool?: (tool: ToolStep) => void;
 }
 
 export interface SendOptions {
@@ -65,7 +65,7 @@ export interface SessionEvents {
   onStatus: (status: SessionStatus, detail?: string) => void;
   onText: (text: string) => void;
   onThought: (text: string) => void;
-  onTool: (tool: { id: string; title: string; status: string }) => void;
+  onTool: (tool: ToolStep) => void;
   onTurnEnd: (reason?: string) => void;
   onError: (message: string) => void;
   onNeedsSetup: (reason: "missing" | "signin" | "failed", detail?: string) => void;
@@ -112,6 +112,81 @@ function contentToText(content: any): string {
     if (content.content) return contentToText(content.content);
   }
   return "";
+}
+
+/**
+ * Readable names for the steps Kiro reports.
+ *
+ * Measured against kiro-cli 2.20.2: the first notification for a step is a
+ * `tool_call_chunk` whose title is only the kind — literally `"read"` — and
+ * the real title (`"Reading package.json:1"`) arrives with the `tool_call`
+ * that follows. Showing "read" for that first moment is worse than showing a
+ * verb, so a title that is nothing but the kind gets translated.
+ */
+const TOOL_VERBS: Record<string, string> = {
+  read: "Reading",
+  write: "Writing",
+  fswrite: "Writing",
+  edit: "Editing",
+  strreplace: "Editing",
+  search: "Searching",
+  grep: "Searching",
+  glob: "Finding files",
+  list: "Listing",
+  execute: "Running",
+  shell: "Running",
+  bash: "Running",
+  fetch: "Fetching",
+  think: "Thinking",
+  delete: "Deleting",
+  move: "Moving",
+};
+
+export interface ToolStep {
+  id: string;
+  title: string;
+  status: string;
+  /** Kiro's own note on why it is doing this, when it sends one. */
+  purpose?: string;
+}
+
+export function describeTool(update: any): ToolStep {
+  const kind = String(update?.kind ?? "").trim();
+  const raw = String(update?.title ?? update?.rawInput?.command ?? kind ?? "tool").trim();
+  const bare = raw.toLowerCase().replace(/[^a-z]/g, "");
+  // Only a title that says nothing but the kind is replaced; a real one wins.
+  const title =
+    raw && bare === kind.toLowerCase().replace(/[^a-z]/g, "")
+      ? TOOL_VERBS[bare] ?? (raw.charAt(0).toUpperCase() + raw.slice(1))
+      : raw || "Working";
+
+  const purpose = String(update?.rawInput?.__tool_use_purpose ?? "").trim();
+  return {
+    id: String(update?.toolCallId ?? update?.id ?? Math.random()),
+    title,
+    // Only `tool_call_update` carries a status; the earlier two are underway.
+    status: String(update?.status ?? "running"),
+    purpose: purpose || undefined,
+  };
+}
+
+/**
+ * Whether a notification is a session update, under either name Kiro uses.
+ *
+ * Measured against kiro-cli 2.20.2 by capturing a whole turn: Kiro sends its
+ * updates under **two** methods. `session/update` carries `tool_call`,
+ * `tool_call_update` and every `agent_message_chunk`; `_kiro.dev/session/update`
+ * carries the `tool_call_chunk` — the first word that a step is starting.
+ *
+ * Only the unprefixed name was accepted, so every one of those first
+ * notifications was dropped at the door and merely logged. That is exactly the
+ * window in which the panel has nothing to say but "Working…", and it is the
+ * longest-feeling part of a turn. `_kiro.dev/metadata` had the same shape and
+ * was already handled by naming both spellings; this does it for all of them.
+ */
+export function isSessionUpdate(method: string): boolean {
+  const bare = String(method ?? "").replace(/^_?kiro\.dev\//, "");
+  return bare === "session/update" || bare === "session/notification";
 }
 
 function normaliseKind(kind: unknown): string {
@@ -608,7 +683,7 @@ export class KiroSession {
       this.readUsage(params);
       return;
     }
-    if (method !== "session/update" && method !== "session/notification") {
+    if (!isSessionUpdate(method)) {
       this.output.appendLine(`[notify] ${method}`);
       return;
     }
@@ -650,14 +725,17 @@ export class KiroSession {
         else this.events.onThought(thought);
         break;
       }
+      // `tool_call_chunk` is the first word that a step is starting, and it
+      // arrives before `tool_call` has worked out a title. Ignoring it left
+      // the panel saying only "Working…" for the whole of that gap.
+      case "tool_call_chunk":
       case "tool_call":
       case "tool_call_update": {
         this.observeDirectFileWrite(update);
-        const tool = {
-          id: String(update.toolCallId ?? update.id ?? Math.random()),
-          title: String(update.title ?? update.rawInput?.command ?? update.kind ?? "tool"),
-          status: String(update.status ?? "running"),
-        };
+        const tool = describeTool(update);
+        this.output.appendLine(
+          `[tool] ${tool.status} ${tool.title}${tool.purpose ? ` — ${tool.purpose}` : ""}`
+        );
         if (this.sink) this.sink.onTool?.(tool);
         else this.events.onTool(tool);
         break;

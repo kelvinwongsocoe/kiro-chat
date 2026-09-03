@@ -219,6 +219,25 @@ The extension advertises `terminal: false` in its client capabilities, so Kiro n
 
 These are the things that were expensive to discover; the comments in `kiroSession.ts` cover them at length:
 
+- **Updates arrive under two method names.** `session/update` carries `tool_call`,
+  `tool_call_update` and every `agent_message_chunk`; **`_kiro.dev/session/update` carries
+  the `tool_call_chunk`**. `isSessionUpdate` strips an optional `_kiro.dev/` / `kiro.dev/`
+  prefix and must keep doing so — matching only the bare name rejected every
+  `tool_call_chunk` at the door, so the panel had nothing to show for the whole gap before
+  a step's real title arrived. `_kiro.dev/metadata` has the same shape and is why both
+  spellings were already named there. **Assume any Kiro notification may carry the
+  prefix.**
+- **A step is announced three times, and the first one matters.** Measured by driving
+  `kiro-cli acp` directly: `tool_call_chunk` fires the moment Kiro decides to use a tool
+  and carries **only the kind as its title** (literally `"read"`) and no status;
+  `tool_call` follows with the real title (`"Reading package.json:1"`), `locations` and
+  `rawInput`; `tool_call_update` finally carries `status`. All three share a
+  `toolCallId`, so they collapse to one row. Handling only the last two left the panel on
+  "Working…" for the whole of the first gap, which is the part of a turn that feels
+  longest. `describeTool` translates a title that is nothing but the kind through
+  `TOOL_VERBS`, and a real title always wins. `rawInput.__tool_use_purpose` is Kiro's own
+  note on *why*, and is the reason the steps list is worth unfolding.
+  `test/toolSteps.test.js` pins all of this to the captured payloads.
 - **`runCommand`** hits `_kiro.dev/commands/execute` with an adjacently-tagged enum: `{ sessionId, command: { command: "usage", args: {} } }`. A plain string, or a name with a leading `/`, is rejected outright.
 - **`textSpy`** — Kiro's own commands narrate through the ordinary `agent_message_chunk` stream. The spy diverts that so command output doesn't land in the transcript as if the user had asked for it.
 - **Credit rates need a second call.** The model list returned by `session/new` carries no rate; only the `model` command has `rateMultiplier` and the context window. `enrichModels()` fetches it in the background after connecting.
@@ -293,9 +312,38 @@ a global cap let a busy project evict a quiet one's history.
 
 ### Modules kept free of `vscode` on purpose
 
-`src/usage.ts`, `src/setupWatcher.ts`, `src/startupError.ts`, `src/history.ts` and the `needsShell`/`quote` exports of `src/acpClient.ts` have no `vscode` import so the tests can `require("../out/...")` directly. There is no VS Code test harness in this repo — that constraint is the entire testing strategy. Keep new parsing and logic modules importable without `vscode`.
+`src/usage.ts`, `src/setupWatcher.ts`, `src/startupError.ts`, `src/history.ts`, `src/promptBlocks.ts` and the `needsShell`/`quote` exports of `src/acpClient.ts` have no `vscode` import so the tests can `require("../out/...")` directly. There is no VS Code test harness in this repo — that constraint is the entire testing strategy. Keep new parsing and logic modules importable without `vscode`.
 
 `setupWatcher.ts` additionally takes its timers through an injected `Scheduler`, so `test/setupWatcher.test.js` drives the whole state machine without waiting out a real interval. Follow that pattern for anything else that polls.
+
+**The file/selection duplication has to be fixed in two places.** `renderChips` (the row
+above the box) and `addUserBubble` (the tags under a sent message) each build that list
+independently, so fixing one leaves the other showing `media/chat.js` beside
+`media/chat.js:23-27`. Both drop the file when the selection covers it, and both name
+files with `fileName()`, keeping the path in the tooltip.
+
+**The selection chip reports state; it is not a control.** It carried an × that stopped
+the highlighted code being sent, which left the editor showing a selection the panel had
+decided not to send — and no way to tell from either side which was true. Clearing the
+highlight is the only way to stop it, so `includeSelection` is now driven solely by the
+`kiroChat.sendSelection` setting and nothing in the webview writes to it. The chip also
+shows only the basename (`fileName()`); the full path stays in the tooltip and in what is
+sent to Kiro.
+
+`promptBlocks.ts` holds the last handling of the user's own text before it leaves, so it
+takes its URI maker as an argument rather than importing `vscode`. Three rules there each
+fixed a way Kiro was told something untrue, and all three are load-bearing:
+
+- **`canReadSelectionFrom` is a scheme allow-list, not a deny-list.** It used to exclude
+  only `output`, so the change-review tab (`kiro-change-review:/<id>/chat.js (Working
+  Tree)`) counted as the file being looked at — clicking in a diff, which is how its
+  keybindings are used, then made the next message claim a path that exists nowhere. Git's
+  sides and search editors are the same shape of mistake.
+- **`fenceFor` beats the longest backtick run in the selection.** A fixed ``` fence is
+  ended by the first such line inside the code, so a markdown file or a template literal
+  spilled the rest of the message out of the block and Kiro read the user's code as prose.
+- **`clipSelection` reports that it clipped**, and `buildBlocks` says so beside the line
+  range. Naming lines 26–480 over the first 12k characters claims Kiro has all of it.
 
 `usage.ts` is deliberately defensive and **never invents a number**: a multiplier is only read as a credit rate when it sits next to the word "credit", and prose parsing only considers lines that mention credits. Preserve that when touching it.
 
@@ -306,9 +354,77 @@ a global cap let a busy project evict a quiet one's history.
 - `[hidden] { display: none !important }` must sit **above** the component rules in `chat.css`. Author `display` rules outrank the browser's own `[hidden]`, so without the override the attach menu, drop overlay, usage strip and chip row are painted permanently. Four elements are toggled this way: `#chips`, `#usage-bar`, `#dropzone`, `#attach-menu`.
 - `.dropzone`, `.chips`, `.usage-bar`, `.popup`, `.usage-panel` each get exactly one rule block.
 - `.usage-bar` is a `<button>` (it toggles the account panel) and must keep opting out of the global `button` styling, or the whole strip paints in the primary colour.
+- **`.composer-row` sets `--control-h` and every control in it takes that height.** They used to be sized three different ways and none of them lined up. Anything added to that row takes `--control-h` too. `.icon` also joined the `[hidden]` list above when Stop became an icon button: it is toggled with the `hidden` attribute and carries `display: inline-flex`, so it must stay below the `[hidden]` override.
+- **A plain-looking button must cancel `button:hover`, not just `button`.** `background: none` on a class beats `button`, but `button:hover` is a type plus a pseudo-class — specificity (0,1,1) — and outranks any single class, so the element sits transparent at rest and then paints solid primary blue under the pointer. This shipped three times (`.usage-bar`, `button.change-summary`, `.history-open`, which covered the row's own hover tint with a blue slab). The test walks every rule declaring both `background: none` and `border: none` and requires a matching `:hover`.
 - Menus are anchored inside positioned parents (`.attach-wrap`, `.composer`) so they can't spill out of a narrow sidebar.
 
 **CSP is nonce-based** (`script-src 'nonce-...'`), so there are no inline handlers in the HTML — everything is wired up in `chat.js`. Text from Kiro goes through `escapeHtml` before the small hand-rolled markdown renderer runs, so a reply cannot inject markup.
+
+**`renderMarkdown`'s `FENCE` pattern is anchored to a line, and must stay that way.**
+Matching ``` anywhere meant a run of backticks *inside a sentence* — "uses longer fences
+(````)", a snippet quoted mid-line, any answer about markdown — opened a code block and
+swallowed the remainder of the reply into it. The more a reply discussed code, the more
+likely it was to be destroyed. Two details that look removable and are not: the closing
+fence is anchored too, and the unterminated branch is `(?![\s\S])` rather than `$` —
+under the `m` flag `$` means end of *line*, which would cut every block at its first
+newline, and a streaming reply is unterminated for as long as it is arriving. Line
+endings are normalised to `\n` before any of this runs, because the pattern consumed `\n`
+after the language but not `\r\n`, leaving a carriage return that `<pre>` painted as a
+blank line above and below every snippet.
+
+**The code-block copy button is delegated, and it must stay that way.** A streaming reply
+runs `body.innerHTML = renderMarkdown(buffer)` on every frame, so a listener bound to the
+button is discarded several times a second and the control dies mid-reply. One listener
+sits on `#messages` and resolves `closest(".code-copy")`. It copies `code.textContent` —
+the rendered element — so what reaches the clipboard is exactly what is on screen, with no
+second escaping pass to get wrong, and it re-checks `isConnected` before writing its
+"copied" state because the button may have been replaced while the clipboard call was in
+flight. When both clipboard routes are refused it selects the code and says to press
+Ctrl+C; a button that silently does nothing is worse than no button.
+
+**The turn's progress is shown where the answer will be, not on the status line.**
+`startThinking()` runs on `userMessage` — not on the first chunk, which is the thing being
+waited for — and starts a one-second interval so the header keeps counting *while the
+reply streams*; the elapsed number is what separates a slow turn from a stuck one, so only
+`finishAgentBubble` stops it. `finishAgentBubble` must also `clearInterval` on the bubble
+it discards, or an abandoned timer ticks against a removed node forever.
+
+The agent body must not be created with the `cursor` class, and the chunk handler toggles
+it on `buffer.trim()`: a blinking block over an empty bubble claims a reply has started
+when an empty first chunk is all that has arrived.
+
+`updateStepsLabel` puts the *newest unfinished* step on that header — "Working…" answers
+the wrong question while waiting; what the user wants to know is what it is doing. It runs
+from the `tool` case, which also calls `startThinking()` itself, because a tool update can
+arrive by a route that never posted a `userMessage`.
+
+**The steps list is open while the turn runs and folds when it ends.** Closed-by-default
+hid the one thing the list is for — watching Kiro read and edit — so the `tool` case opens
+it and `stopThinking` closes it. `steps.dataset.pinned` records that the user clicked the
+header, and both of those checks respect it: a list someone opened on purpose must not
+fold itself up when the turn finishes.
+
+**`AcpClient.dispatch` is called inside a try/catch, and must stay that way.** Kiro often
+writes several notifications in one stdio write; the read loop walks them in order, so a
+throw in any handler used to abandon the loop and drop every remaining line in that write
+— silently, and indistinguishably from Kiro never having sent them.
+
+**The steps list folds, so nothing that needs an answer may live in it.**
+`addPermissionCard` inserts before `bubble.body`, never into `bubble.tools` — a permission
+card inside a closed list cannot be seen or answered, and the turn hangs waiting.
+`renderToolRow(row, tool, phase)` is shared by all three paths: `"live"` shows a spinner
+and *no* tick on finished steps (a column of them beside running work is noise), `"done"`
+adds the ticks once the turn is over, and `"restored"` never spins, because a chat from
+last week is not still working.
+
+**Code blocks are coloured from the theme's own colour keys, not the editor's tokens.**
+VS Code does not expose TextMate token colours to a webview, so `highlightCode` marks
+comments, strings, numbers, keywords and call sites and paints them with
+`--vscode-debugTokenExpression-*` / `--vscode-symbolIcon-*`, which are the theme's colours
+for the same ideas. The tokenizer stays small on purpose — a wrong colour reads worse than
+no colour — and the comment style follows the language (`//` is floor division in Python,
+`#` is a colour in CSS). Everything still goes through `escapeHtml` before it reaches the
+output; the spans are the only markup added.
 
 **The webview is destroyed and rebuilt** whenever the user drags the panel between the sidebar, the bottom panel and the secondary sidebar. `chat.js` persists the transcript through `vscode.setState`, then posts `ready` with a `restored` flag; `onWebviewReady` branches on it — restored means leave the session alone, blank means hand the user a fresh connected chat. Anything that must survive a move has to live in webview state.
 

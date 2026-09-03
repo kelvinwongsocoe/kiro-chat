@@ -622,7 +622,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
               startLine: this.selection.startLine,
               endLine: this.selection.endLine,
               hasSelection: this.selection.hasSelection,
-              lineCount: this.selection.endLine - this.selection.startLine + 1,
             }
           : undefined,
         // The file being looked at, shown as its own chip and sent with the
@@ -1028,7 +1027,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
     <div class="composer-row">
       <div class="attach-wrap">
-        <button type="button" id="attach" class="icon" title="Attach files, folders or an image" aria-haspopup="true" aria-expanded="false">+</button>
+        <button type="button" id="attach" class="icon" title="Attach files, folders or an image" aria-label="Attach files, folders or an image" aria-haspopup="true" aria-expanded="false">
+          <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M8.5 3a.5.5 0 0 0-1 0v4.5H3a.5.5 0 0 0 0 1h4.5V13a.5.5 0 0 0 1 0V8.5H13a.5.5 0 0 0 0-1H8.5V3Z"/></svg>
+        </button>
         <div id="attach-menu" class="popup" hidden>
           <button type="button" data-act="attachFiles">Files from this project</button>
           <button type="button" data-act="attachFolders">A folder</button>
@@ -1036,22 +1037,26 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         </div>
       </div>
       <div class="mode-wrap">
-        <button type="button" id="mode-btn" class="mode-btn" aria-haspopup="listbox" aria-expanded="false">
+        <button type="button" id="mode-btn" class="mode-btn" title="Workflow" aria-haspopup="listbox" aria-expanded="false">
+          <svg class="btn-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 4.5A.5.5 0 0 1 2.5 4h5a.5.5 0 0 1 0 1h-5a.5.5 0 0 1-.5-.5Zm0 3.5a.5.5 0 0 1 .5-.5h11a.5.5 0 0 1 0 1h-11A.5.5 0 0 1 2 8Zm0 3.5a.5.5 0 0 1 .5-.5h8a.5.5 0 0 1 0 1h-8a.5.5 0 0 1-.5-.5Z"/></svg>
           <span id="mode-label">Default</span>
-          <span class="caret">&#9662;</span>
         </button>
         <div id="mode-menu" class="mode-menu" hidden role="listbox"></div>
       </div>
       <div class="model-wrap">
-        <button type="button" id="model-btn" class="model-btn" aria-haspopup="listbox" aria-expanded="false" disabled>
+        <button type="button" id="model-btn" class="model-btn" title="Model" aria-haspopup="listbox" aria-expanded="false" disabled>
+          <svg class="btn-icon" viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M6 1.5a.5.5 0 0 1 1 0V3h2V1.5a.5.5 0 0 1 1 0V3h.5A1.5 1.5 0 0 1 12 4.5V5h1.5a.5.5 0 0 1 0 1H12v2h1.5a.5.5 0 0 1 0 1H12v.5a1.5 1.5 0 0 1-1.5 1.5H10v1.5a.5.5 0 0 1-1 0V11H7v1.5a.5.5 0 0 1-1 0V11h-.5A1.5 1.5 0 0 1 4 9.5V9H2.5a.5.5 0 0 1 0-1H4V6H2.5a.5.5 0 0 1 0-1H4v-.5A1.5 1.5 0 0 1 5.5 3H6V1.5ZM5 4.5v5a.5.5 0 0 0 .5.5h5a.5.5 0 0 0 .5-.5v-5a.5.5 0 0 0-.5-.5h-5a.5.5 0 0 0-.5.5Z"/></svg>
           <span id="model-label">Default model</span>
-          <span class="caret">&#9662;</span>
         </button>
         <div id="model-menu" class="model-menu" hidden role="listbox"></div>
       </div>
       <span class="spacer"></span>
-      <button type="button" id="stop" class="ghost" hidden>Stop</button>
-      <button type="submit" id="send">Send</button>
+      <button type="button" id="stop" class="icon danger" hidden title="Stop this reply" aria-label="Stop this reply">
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><rect x="4" y="4" width="8" height="8" rx="1.5"/></svg>
+      </button>
+      <button type="submit" id="send" class="icon primary" title="Send" aria-label="Send">
+        <svg viewBox="0 0 16 16" aria-hidden="true" focusable="false"><path d="M2 8a.75.75 0 0 1 .75-.75h8.19L7.72 4.03a.75.75 0 0 1 1.06-1.06l4.5 4.5a.75.75 0 0 1 0 1.06l-4.5 4.5a.75.75 0 1 1-1.06-1.06l3.22-3.22H2.75A.75.75 0 0 1 2 8Z"/></svg>
+      </button>
     </div>
   </form>
 

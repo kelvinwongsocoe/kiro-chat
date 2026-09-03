@@ -2,7 +2,7 @@
   "name": "kiro-chat",
   "displayName": "Kiro Chat",
   "description": "Chat with the Kiro agent inside VS Code, like Copilot Chat.",
-  "version": "0.14.1",
+  "version": "0.22.2",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -92,8 +92,7 @@
       },
       {
         "command": "kiroChat.askInChat",
-        "title": "Kiro Chat: Ask in VS Code Chat (drag files here)",
-        "icon": "$(comment-discussion)"
+        "title": "Kiro Chat: Ask in VS Code Chat (drag files here)"
       }
     ],
     "menus": {
@@ -117,11 +116,6 @@
           "command": "kiroChat.showHistory",
           "when": "view == kiroChat.view",
           "group": "navigation@3"
-        },
-        {
-          "command": "kiroChat.askInChat",
-          "when": "view == kiroChat.view",
-          "group": "navigation@4"
         }
       ],
       "editor/context": [
@@ -216,7 +210,7 @@
         "kiroChat.sendSelection": {
           "type": "boolean",
           "default": true,
-          "description": "Send the code you have highlighted along with your message. You can also switch this off per message using the chip above the text box."
+          "description": "Send the code you have highlighted along with your message. The chip above the text box shows what is going; clear the highlight in the editor to leave it out."
         }
       }
     },

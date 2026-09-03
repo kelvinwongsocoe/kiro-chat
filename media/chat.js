@@ -148,14 +148,131 @@
       .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g, '<a href="$2">$1</a>');
   }
 
-  function renderMarkdown(source) {
+  /*
+   * The copy control on a code block.
+   *
+   * Static markup of ours, not anything from Kiro, so it is safe to build by
+   * hand here — everything from the agent is escaped before it reaches this.
+   * The click is handled by one delegated listener rather than a listener per
+   * button, because a streaming reply rebuilds this markup on every frame.
+   */
+  const COPY_ICON =
+    '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">' +
+    '<path d="M4 2.5A1.5 1.5 0 0 1 5.5 1h5A1.5 1.5 0 0 1 12 2.5V3h.5A1.5 1.5 0 0 1 14 4.5v9a1.5 1.5 0 0 1-1.5 1.5h-7A1.5 1.5 0 0 1 4 13.5V13h-.5A1.5 1.5 0 0 1 2 11.5v-9A1.5 1.5 0 0 1 3.5 1H4v1.5Zm1 10.5a.5.5 0 0 0 .5.5h7a.5.5 0 0 0 .5-.5v-9a.5.5 0 0 0-.5-.5h-7a.5.5 0 0 0-.5.5v9ZM4 4H3.5a.5.5 0 0 0-.5.5v7a.5.5 0 0 0 .5.5H4V4Z"/>' +
+    "</svg>";
+  const CHECK_ICON =
+    '<svg viewBox="0 0 16 16" aria-hidden="true" focusable="false">' +
+    '<path d="M13.7 4.3a1 1 0 0 1 0 1.4l-6 6a1 1 0 0 1-1.4 0l-3-3a1 1 0 1 1 1.4-1.4L7 9.6l5.3-5.3a1 1 0 0 1 1.4 0Z"/>' +
+    "</svg>";
+
+  /*
+   * Colouring a code block.
+   *
+   * VS Code does not expose the editor's TextMate token colours to a webview,
+   * so an exact match with the editor is not on offer. What it does expose is
+   * the theme's own colour keys, and several of them are the same idea under
+   * another name — `debugTokenExpression.string` is the theme's string
+   * colour, `symbolIcon.keywordForeground` its keyword colour. Colouring from
+   * those follows whatever theme is active instead of hard-coding a palette
+   * that fights it.
+   *
+   * The tokenizer is deliberately small. It marks comments, strings, numbers
+   * and keywords and leaves everything else alone, because a wrong colour
+   * reads worse than no colour.
+   */
+  const HASH_COMMENT_LANGS =
+    /^(py|python|sh|bash|zsh|shell|console|yaml|yml|rb|ruby|toml|ini|conf|cfg|dockerfile|docker|makefile|make|ps1|powershell|r|perl|pl|nix|elixir|ex)$/;
+
+  const CODE_KEYWORDS = new Set(
+    ("abstract and as assert async await break case catch class const constructor continue " +
+      "declare def default del delete do elif else elseif end enum export extends finally fn " +
+      "for from func function global go if impl implements import in instanceof interface is " +
+      "lambda let loop match mod module mut namespace new not or package pass private protected " +
+      "public raise readonly require rescue return select static struct super switch then this " +
+      "throw trait try type typeof union unless until use var void when where while with yield")
+      .split(" ")
+  );
+  const CODE_CONSTANTS = new Set(
+    "true false null nil none None True False undefined NaN Infinity self".split(" ")
+  );
+
+  /** Escaped HTML for one code block, with spans around what we recognise. */
+  function highlightCode(code, lang) {
+    const hash = HASH_COMMENT_LANGS.test(String(lang || "").toLowerCase());
+    // `//` is floor division in Python and `#` is a colour in CSS, so the
+    // comment style follows the language rather than trying to be both.
+    const comment = hash ? "#[^\\n]*" : "\\/\\*[\\s\\S]*?\\*\\/|\\/\\/[^\\n]*";
+    const pattern = new RegExp(
+      "(" + comment + ")" +
+        "|(\"(?:[^\"\\\\\\n]|\\\\.)*\"?|'(?:[^'\\\\\\n]|\\\\.)*'?|`(?:[^`\\\\]|\\\\.)*`?)" +
+        "|(\\b\\d[\\w.]*\\b)" +
+        "|([A-Za-z_$][\\w$]*)",
+      "g"
+    );
+
+    let out = "";
+    let last = 0;
+    let match;
+    while ((match = pattern.exec(code))) {
+      out += escapeHtml(code.slice(last, match.index));
+      last = pattern.lastIndex;
+      const text = escapeHtml(match[0]);
+      if (match[1]) out += `<span class="tok-comment">${text}</span>`;
+      else if (match[2]) out += `<span class="tok-string">${text}</span>`;
+      else if (match[3]) out += `<span class="tok-number">${text}</span>`;
+      else if (CODE_CONSTANTS.has(match[4])) out += `<span class="tok-const">${text}</span>`;
+      else if (CODE_KEYWORDS.has(match[4])) out += `<span class="tok-keyword">${text}</span>`;
+      else if (code[pattern.lastIndex] === "(") out += `<span class="tok-fn">${text}</span>`;
+      else out += text;
+    }
+    return out + escapeHtml(code.slice(last));
+  }
+
+  function renderMarkdown(rawSource) {
     const blocks = [];
-    const withoutCode = source.replace(/```([\w-]*)\n?([\s\S]*?)(?:```|$)/g, (_, lang, code) => {
+    /*
+     * Line endings are normalised before anything else looks at the text.
+     *
+     * The fence pattern consumed `\n` after the language but not `\r\n`, so a
+     * reply with Windows line endings — which is most of them, on Windows —
+     * left the carriage return inside the block. Every code snippet came out
+     * with a blank line above and below it, and `<pre>` renders a lone `\r` as
+     * a break so it was not even visibly whitespace. Doing this once here
+     * fixes fences, headings and lists together.
+     */
+    const source = String(rawSource).replace(/\r\n?/g, "\n");
+    /*
+     * A fence only opens a block at the start of a line.
+     *
+     * This used to match ``` anywhere, so a run of backticks *inside a
+     * sentence* — "uses longer fences (````)", a shell snippet quoted inline,
+     * anything discussing markdown — opened a code block, and the whole rest
+     * of the reply was swallowed into it as code. That is what markdown's
+     * line anchor is for, and leaving it out is the single worst thing a
+     * hand-rolled renderer can get wrong: the more the reply talks about
+     * code, the more likely it is to be destroyed.
+     *
+     * `(?![\s\S])` rather than `$` for the unterminated case: `$` under the
+     * `m` flag means end of *line*, which would cut every block at its first
+     * newline. Streaming replies rely on that branch.
+     */
+    const FENCE = /^[ \t]{0,3}```([^\n`]*)\n?([\s\S]*?)(?:^[ \t]{0,3}```[ \t]*$|(?![\s\S]))/gm;
+    const withoutCode = source.replace(FENCE, (_, info, code) => {
+      // An info string may carry more than the language; the first word is it.
+      const lang = String(info).trim().split(/\s+/)[0] || "";
       const index = blocks.length;
       blocks.push(
-        `<pre><code class="language-${escapeHtml(lang || "text")}">${escapeHtml(
-          code.replace(/\n$/, "")
-        )}</code></pre>`
+        '<div class="code-block">' +
+          '<button type="button" class="code-copy" title="Copy code" aria-label="Copy code">' +
+          COPY_ICON +
+          "</button>" +
+          // The newline before the closing fence belongs to the fence, not to
+          // the code — and neither does the indent in front of it.
+          `<pre><code class="language-${escapeHtml(lang || "text")}">${highlightCode(
+            code.replace(/\n[ \t]*$/, ""),
+            lang
+          )}</code></pre>` +
+          "</div>"
       );
       // Newlines around it so the placeholder always lands on a line of
       // its own, even when the fence was opened part-way through a sentence.
@@ -219,6 +336,79 @@
     return html.join("");
   }
 
+  /*
+   * Copying a code block.
+   *
+   * One listener on the transcript rather than one per button: a streaming
+   * reply re-renders its markdown on every frame, so any listener bound to a
+   * button would be thrown away several times a second.
+   *
+   * The text comes from the rendered <code> element, so what lands on the
+   * clipboard is exactly what is on screen — no second escaping pass to get
+   * wrong.
+   */
+  async function copyText(text) {
+    try {
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch (err) {
+      // Denied or unavailable. Fall through to the old way.
+    }
+    try {
+      const pad = document.createElement("textarea");
+      pad.value = text;
+      pad.setAttribute("readonly", "");
+      pad.style.position = "fixed";
+      pad.style.opacity = "0";
+      document.body.appendChild(pad);
+      pad.select();
+      const ok = document.execCommand("copy");
+      pad.remove();
+      return ok;
+    } catch (err) {
+      return false;
+    }
+  }
+
+  messagesEl.addEventListener("click", async (event) => {
+    const button = event.target.closest && event.target.closest(".code-copy");
+    if (!button) return;
+    event.preventDefault();
+    const block = button.closest(".code-block");
+    const code = block && block.querySelector("code");
+    if (!code) return;
+
+    const ok = await copyText(code.textContent);
+    if (!ok) {
+      // Both routes refused — a policy that blocks the clipboard, usually.
+      // Selecting the code is the one thing left that makes Ctrl+C work, so
+      // do that rather than leave the user with a button that did nothing.
+      try {
+        const range = document.createRange();
+        range.selectNodeContents(code);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+      } catch (err) {
+        // Then there is nothing more to offer.
+      }
+    }
+    // The button is still in the document only if the reply is not mid-render.
+    if (!button.isConnected) return;
+    button.classList.toggle("copied", ok);
+    button.innerHTML = ok ? CHECK_ICON : COPY_ICON;
+    button.title = ok ? "Copied" : "Selected — press Ctrl+C to copy";
+    clearTimeout(button.resetTimer);
+    button.resetTimer = setTimeout(() => {
+      if (!button.isConnected) return;
+      button.classList.remove("copied");
+      button.innerHTML = COPY_ICON;
+      button.title = "Copy code";
+    }, 1600);
+  });
+
   // ---------------------------------------------------------------
   // Message bubbles
   // ---------------------------------------------------------------
@@ -261,10 +451,11 @@
     const was = atBottom();
     const node = document.createElement("div");
     node.className = "msg user";
-    node.appendChild(roleLabel("You"));
-
+    // No role label here: the block is what says whose turn this is, and a
+    // sidebar three inches wide cannot spare a line to repeat it.
     if (message.text) {
       const body = document.createElement("div");
+      body.className = "user-text";
       body.textContent = message.text;
       node.appendChild(body);
     }
@@ -278,24 +469,101 @@
       node.appendChild(strip);
     }
 
+    /*
+     * The selection stands in for the file it came from, here as in the chip
+     * row above the box. A message sent with a highlight used to carry both
+     * "media/chat.js" and "media/chat.js:23-27" \u2014 the same file twice, one of
+     * them saying strictly less. Only the range survives, and it is named the
+     * way the chips are: the file's name, with the path in the tooltip.
+     */
+    const selected = message.selection
+      ? String(message.selection).replace(/:\d+-\d+$/, "")
+      : "";
     const tags = [];
     for (const a of message.attachments || []) {
-      if (!a.preview) tags.push(`${iconFor(a.kind)} ${a.label}`);
+      if (a.preview) continue;
+      if (selected && samePathish(a.label, selected)) continue;
+      tags.push({ text: `${iconFor(a.kind)} ${fileName(a.label)}`, title: a.label });
     }
-    if (message.selection) tags.push(`\u2317 ${message.selection}`);
+    if (message.selection) {
+      const range = String(message.selection).slice(selected.length);
+      tags.push({ text: `\u2317 ${fileName(selected)}${range}`, title: message.selection });
+    }
     if (message.mode && message.mode !== "default") {
-      tags.push(`\u25c7 ${message.modeLabel || message.mode}`);
+      tags.push({ text: `\u25c7 ${message.modeLabel || message.mode}`, title: "" });
     }
 
     if (tags.length) {
       const meta = document.createElement("div");
       meta.className = "msg-context";
-      meta.textContent = tags.join("   ");
+      for (const tag of tags) {
+        const item = document.createElement("span");
+        item.className = "msg-tag";
+        item.textContent = tag.text;
+        // The name is what is shown; the whole path is what disambiguates it.
+        if (tag.title && tag.title !== tag.text) item.title = tag.title;
+        meta.appendChild(item);
+      }
       node.appendChild(meta);
     }
 
     messagesEl.appendChild(node);
     scroll(was);
+  }
+
+  /*
+   * The steps group: one line saying what is happening, with the detail
+   * folded away behind it.
+   *
+   * A turn can run a dozen tools, and listing them all pushed the answer off
+   * the screen before it arrived. The header carries the state — and the
+   * elapsed time, which is the thing that tells a slow turn from a stuck one
+   * — and the list opens on a click.
+   */
+  function buildSteps() {
+    const steps = document.createElement("div");
+    steps.className = "steps";
+    steps.hidden = true;
+
+    const head = document.createElement("button");
+    head.type = "button";
+    head.className = "steps-head";
+    head.setAttribute("aria-expanded", "false");
+
+    const icon = document.createElement("span");
+    icon.className = "steps-icon";
+    icon.setAttribute("aria-hidden", "true");
+    const label = document.createElement("span");
+    label.className = "steps-label";
+    const time = document.createElement("span");
+    time.className = "steps-time";
+    head.append(icon, label, time);
+
+    const list = document.createElement("div");
+    list.className = "steps-list";
+    list.hidden = true;
+
+    const open = (on) => {
+      list.hidden = !on;
+      head.setAttribute("aria-expanded", String(on));
+      steps.classList.toggle("open", on);
+    };
+    head.addEventListener("click", () => {
+      // Once the user has an opinion, it sticks: the turn ending must not
+      // fold up a list they opened on purpose.
+      steps.dataset.pinned = "1";
+      open(list.hidden);
+    });
+
+    steps.append(head, list);
+    return { steps, head, icon, label, time, list, open };
+  }
+
+  /** "4s", "12s", "1m 05s" — short enough to sit at the end of a line. */
+  function elapsedText(ms) {
+    const total = Math.max(0, Math.round(ms / 1000));
+    if (total < 60) return `${total}s`;
+    return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
   }
 
   function ensureAgentBubble() {
@@ -304,16 +572,180 @@
     const root = document.createElement("div");
     root.className = "msg agent";
     root.appendChild(roleLabel("Kiro"));
-    const tools = document.createElement("div");
-    tools.className = "tools";
+    const group = buildSteps();
+    const tools = group.list;
     const body = document.createElement("div");
-    body.className = "body cursor";
-    root.appendChild(tools);
+    // No cursor until there is text to trail: an empty bubble showing a
+    // blinking block above "Working…" claims a reply has started when the
+    // first token has not arrived. The chunk handler turns it on.
+    body.className = "body";
+    root.appendChild(group.steps);
     root.appendChild(body);
     messagesEl.appendChild(root);
-    current = { root, tools, body, toolList: [] };
+    current = { root, group, tools, body, toolList: [], startedAt: 0, timer: 0 };
     buffer = "";
     return current;
+  }
+
+  /*
+   * "Kiro is working on it", in the transcript.
+   *
+   * The status dot at the very top of the panel was the only sign a turn was
+   * running, and it is nowhere near where the answer will appear. Between
+   * pressing Send and the first token — which is however long Kiro spends
+   * thinking and running tools — the transcript said nothing at all, so a
+   * slow turn was indistinguishable from a dead one. This goes in the moment
+   * the message is sent and is replaced by the reply itself.
+   */
+  function startThinking() {
+    const was = atBottom();
+    const bubble = ensureAgentBubble();
+    if (!bubble.startedAt) {
+      bubble.startedAt = Date.now();
+      bubble.group.steps.hidden = false;
+      bubble.group.steps.classList.add("running");
+      bubble.group.head.setAttribute("role", "status");
+      bubble.group.label.textContent = "Working…";
+      // A ticking second is what separates a slow turn from a stuck one.
+      const tick = () => {
+        if (!bubble.startedAt) return;
+        bubble.group.time.textContent = elapsedText(Date.now() - bubble.startedAt);
+      };
+      tick();
+      bubble.timer = setInterval(tick, 1000);
+    }
+    scroll(was);
+    return bubble;
+  }
+
+  /**
+   * The header says what Kiro is doing right now.
+   *
+   * "Working…" alone does not answer the question you actually have while
+   * waiting, which is *what is it doing* — reading a file, searching, writing
+   * one. The newest unfinished step is the answer, and it is the same line the
+   * whole list unfolds from, so nothing extra is spent on saying it.
+   */
+  function updateStepsLabel(bubble) {
+    if (!bubble || !bubble.group || !bubble.startedAt) return;
+    const steps = bubble.toolList;
+    if (steps.length === 0) {
+      bubble.group.label.textContent = "Working…";
+      bubble.group.head.title = "";
+      return;
+    }
+    const running = [...steps]
+      .reverse()
+      .find((t) => t.status !== "completed" && t.status !== "failed");
+    const step = running || steps[steps.length - 1];
+    bubble.group.label.textContent = step.title;
+    // The line is ellipsised in a narrow panel, so keep the whole of it here.
+    bubble.group.head.title = step.title;
+  }
+
+  /**
+   * The turn is over. The header stops ticking and becomes a summary of what
+   * happened, still folded; the steps are there for anyone who wants them.
+   */
+  function stopThinking(bubble) {
+    const target = bubble || current;
+    if (!target || !target.group) return;
+    if (target.timer) {
+      clearInterval(target.timer);
+      target.timer = 0;
+    }
+    const group = target.group;
+    group.steps.classList.remove("running");
+    const count = target.toolList.length;
+    if (!target.startedAt && count === 0) {
+      group.steps.hidden = true;
+      return;
+    }
+    const took = target.startedAt ? Date.now() - target.startedAt : 0;
+    target.startedAt = 0;
+    /*
+     * One sentence once the turn is over: "Completed 2 steps in 7s".
+     *
+     * While the turn runs the two halves are separate — what it is doing on
+     * the left, the clock ticking on the right — but a finished turn is a
+     * single fact, and splitting it across the line read as a label with a
+     * stray number after it.
+     */
+    const steps = count === 1 ? "1 step" : `${count} steps`;
+    const took_ = took ? ` in ${elapsedText(took)}` : "";
+    group.time.textContent = "";
+
+    if (count === 0) {
+      /*
+       * A turn that ran no steps shows no header at all.
+       *
+       * There was a second shape for this — a line with the chevron slot
+       * standing empty, because there was nothing to unfold — and it sat at a
+       * different indent from the ordinary one. Two versions of the same line,
+       * neither of them wrong on its own and obviously mismatched together.
+       * Dropping it means every header in the transcript has one shape.
+       */
+      group.steps.hidden = true;
+      return;
+    }
+    // The log of what ran stays on screen for every turn that ran anything.
+    // It is folded, and a list the user opened themselves stays open.
+    group.steps.hidden = false;
+    group.label.textContent = `Completed ${steps}${took_}`;
+    // The ticks are welcome now the work has stopped.
+    for (const row of group.list.querySelectorAll(".tool")) {
+      const seen = target.toolList.find((t) => t.id === row.dataset.id);
+      if (seen) renderToolRow(row, seen, "done");
+    }
+  }
+
+  /**
+   * One tool row, drawn the same way live and when a chat is reopened.
+   *
+   * "Reading chat.js — running" put the state in the same grey prose as the
+   * name, so a row that was still going looked like one that had finished.
+   * The glyph carries it now, and `data-status` colours it.
+   */
+  function renderToolRow(row, tool, phase = "live") {
+    row.dataset.status = tool.status;
+    row.textContent = "";
+    const icon = document.createElement("span");
+    icon.className = "tool-icon";
+    icon.setAttribute("aria-hidden", "true");
+    const live = phase === "live";
+    const done = tool.status === "completed";
+    const failed = tool.status === "failed";
+    /*
+     * No marks on a finished step.
+     *
+     * A tick beside every completed row is a column of decoration saying the
+     * same thing over and over — of course they finished, the turn is over.
+     * The only states worth a glyph are the one still running, which gets the
+     * spinner, and a failure, which the row's own colour carries. The slot
+     * stays reserved either way so nothing shifts as a step completes.
+     */
+    icon.textContent = "";
+    // A finished turn — or a reopened chat — must not spin over work that
+    // stopped long ago.
+    if (!done && !failed && live) icon.classList.add("spinning");
+    const text = document.createElement("span");
+    text.className = "tool-text";
+    const title = document.createElement("span");
+    title.className = "tool-title";
+    title.textContent = tool.title;
+    text.appendChild(title);
+    // Kiro says why it is doing each step. That is the part worth unfolding
+    // for — the title alone only says what, not what for.
+    if (tool.purpose) {
+      const why = document.createElement("span");
+      why.className = "tool-purpose";
+      why.textContent = tool.purpose;
+      text.appendChild(why);
+    }
+    row.append(icon, text);
+    // The state is a glyph, so say it in words for a screen reader.
+    row.setAttribute("aria-label", `${tool.title} — ${tool.status}`);
+    return row;
   }
 
   function addPermissionCard(permission) {
@@ -355,7 +787,9 @@
     });
 
     card.append(actions, status);
-    bubble.tools.appendChild(card);
+    // Never inside the steps list: that folds shut, and a permission the user
+    // cannot see is one they cannot answer — the turn would just hang.
+    bubble.root.insertBefore(card, bubble.body);
     scroll(was);
   }
 
@@ -383,10 +817,13 @@
 
   function finishAgentBubble() {
     if (current) {
+      const timer = current.timer;
+      stopThinking(current);
       // Flush whatever the last frame has not painted yet.
       current.body.innerHTML = renderMarkdown(buffer);
       current.body.classList.remove("cursor");
       if (!buffer.trim() && current.tools.children.length === 0) {
+        if (timer) clearInterval(timer);
         current.root.remove();
       } else {
         recordAgent(buffer, current.toolList);
@@ -718,6 +1155,18 @@
     return tidy(a) === tidy(b);
   }
 
+  /**
+   * The chip shows the file's name; the whole path lives in its tooltip.
+   *
+   * A sidebar is narrow, and "media/chat.js:26-26" spent most of that width on
+   * a folder the user is already working in. Nothing sent to Kiro changes —
+   * it still gets the full path — this is only what is drawn.
+   */
+  function fileName(pathish) {
+    const parts = String(pathish || "").split(/[\\/]/);
+    return parts[parts.length - 1] || String(pathish || "");
+  }
+
   function renderChips() {
     chipsEl.innerHTML = "";
 
@@ -727,16 +1176,28 @@
     const activeAlreadyAttached =
       activeFile && attachments.some((a) => samePathish(a.path, activeFile.path));
 
+    /*
+     * A selection always comes from the file you are looking at, so while one
+     * is being sent the two chips named the same file twice — "chat.js" beside
+     * "chat.js:26-26". The narrower one says everything the broader one did,
+     * so it stands for both. Switch the selection off and the file chip comes
+     * back, because then it is the only thing still going.
+     */
+    const selectionCoversActiveFile =
+      selection && selection.hasSelection && includeSelection;
+
     // The file on screen comes first: it is the broadest bit of context, and
     // the selection chip below narrows it down.
-    if (activeFile && includeActiveFile && !activeAlreadyAttached) {
+    if (selectionCoversActiveFile) {
+      // Nothing: the selection chip below names the file.
+    } else if (activeFile && includeActiveFile && !activeAlreadyAttached) {
       const chip = document.createElement("span");
       chip.className = "chip chip-active";
       chip.title = "Kiro can open " + activeFile.label + ". Click × to leave it out.";
 
       const label = document.createElement("span");
       label.className = "chip-active-label";
-      label.textContent = "◎ " + activeFile.label;
+      label.textContent = "◎ " + fileName(activeFile.label);
       chip.appendChild(label);
 
       const off = document.createElement("button");
@@ -755,7 +1216,8 @@
       const chip = document.createElement("button");
       chip.type = "button";
       chip.className = "chip chip-muted";
-      chip.textContent = "◎ add " + activeFile.label;
+      chip.title = activeFile.label;
+      chip.textContent = "◎ add " + fileName(activeFile.label);
       chip.addEventListener("click", () => {
         includeActiveFile = true;
         renderChips();
@@ -763,41 +1225,29 @@
       chipsEl.appendChild(chip);
     }
 
-    if (selection && selection.hasSelection && includeSelection) {
+    /*
+     * The selection chip reports the highlight; it is not a control.
+     *
+     * It used to carry an \u00d7 that stopped the highlighted code being sent, so
+     * the code stayed visibly selected in the editor while the panel had
+     * quietly decided not to send it \u2014 two places disagreeing about the same
+     * thing, and no way to tell from the editor which was true. The editor
+     * owns this: clear the highlight and the chip goes with it.
+     */
+    if (selectionCoversActiveFile) {
       const chip = document.createElement("span");
       chip.className = "chip chip-selection";
-      chip.title = "The code you have highlighted goes with your message. Click to stop sending it.";
+      chip.title =
+        "Kiro gets " +
+        selection.relativePath +
+        " and the highlighted lines. Clear the highlight to stop sending them.";
 
+      // The range is the whole label. A separate "1 line" badge repeated what
+      // 26-26 already said.
       const label = document.createElement("span");
-      label.textContent = `\u2317 ${selection.relativePath}:${selection.startLine}-${selection.endLine}`;
+      label.textContent = `\u2317 ${fileName(selection.relativePath)}:${selection.startLine}-${selection.endLine}`;
       chip.appendChild(label);
 
-      const count = document.createElement("span");
-      count.className = "chip-count";
-      count.textContent = `${selection.lineCount} ${selection.lineCount === 1 ? "line" : "lines"}`;
-      chip.appendChild(count);
-
-      const off = document.createElement("button");
-      off.type = "button";
-      off.className = "chip-x";
-      off.textContent = "\u00d7";
-      off.title = "Do not send the highlighted code";
-      off.addEventListener("click", () => {
-        includeSelection = false;
-        renderChips();
-      });
-      chip.appendChild(off);
-
-      chipsEl.appendChild(chip);
-    } else if (selection && selection.hasSelection && !includeSelection) {
-      const chip = document.createElement("button");
-      chip.type = "button";
-      chip.className = "chip chip-muted";
-      chip.textContent = `\u2317 add ${selection.relativePath}:${selection.startLine}-${selection.endLine}`;
-      chip.addEventListener("click", () => {
-        includeSelection = true;
-        renderChips();
-      });
       chipsEl.appendChild(chip);
     }
 
@@ -813,12 +1263,14 @@
         chip.classList.add("chip-image");
         open.appendChild(thumb);
         const name = document.createElement("span");
-        name.textContent = a.label;
+        name.textContent = fileName(a.label);
         open.appendChild(name);
       } else {
-        open.textContent = `${iconFor(a.kind)} ${a.label}`;
+        open.textContent = `${iconFor(a.kind)} ${fileName(a.label)}`;
       }
+      // The full path is what disambiguates two files with the same name.
       open.title = a.path || a.label;
+      if (a.path) chip.classList.add("chip-open-able");
       if (a.path) {
         open.addEventListener("click", () =>
           vscode.postMessage({ type: "openFile", path: a.path })
@@ -1767,7 +2219,6 @@
 
       case "selection": {
         selection = message.selection || null;
-        if (!selection) includeSelection = true;
 
         // Switching to a different file brings the chip back. Dismissing it
         // means "not this one", not "never again".
@@ -1781,9 +2232,10 @@
       }
 
       case "defaults":
-        // Seeds the highlighted-code toggle from settings, unless a moved
-        // panel already restored the user's own choice.
-        if (typeof message.sendSelection === "boolean" && !restoredChoice) {
+        // The setting decides this on its own now. The chip reports the
+        // highlight rather than switching it off, so there is no per-message
+        // choice left for a restored panel to protect.
+        if (typeof message.sendSelection === "boolean") {
           includeSelection = message.sendSelection;
           renderChips();
         }
@@ -1798,13 +2250,19 @@
         finishAgentBubble();
         addUserBubble(message);
         recordUser(message);
+        // Kiro has the turn now. Say so where the answer will appear, rather
+        // than only on the status line at the top of the panel.
+        startThinking();
         break;
 
       case "chunk": {
         const was = atBottom();
         const bubble = ensureAgentBubble();
+        // The reply itself has arrived, so it replaces "Working…".
         buffer += message.text;
-        bubble.body.classList.add("cursor");
+        // A bare blinking block with nothing before it is not a reply. The
+        // "Working…" header stays until real text has arrived.
+        bubble.body.classList.toggle("cursor", Boolean(buffer.trim()));
         scheduleRepaint(was);
         break;
       }
@@ -1820,15 +2278,40 @@
           row.dataset.id = id;
           bubble.tools.appendChild(row);
         }
-        row.dataset.status = message.tool.status;
-        row.textContent = `${message.tool.title} \u2014 ${message.tool.status}`;
+        // A tool can arrive by a route that never posted a userMessage, so
+        // the header is started here too rather than assumed to be running.
+        startThinking();
+        renderToolRow(row, message.tool, "live");
         const seen = bubble.toolList.find((t) => t.id === id);
         if (seen) {
           seen.title = message.tool.title;
           seen.status = message.tool.status;
+          // A later update carries the real title and the purpose; the first
+          // notification has only the kind.
+          if (message.tool.purpose) seen.purpose = message.tool.purpose;
         } else {
-          bubble.toolList.push({ id, title: message.tool.title, status: message.tool.status });
+          bubble.toolList.push({
+            id,
+            title: message.tool.title,
+            status: message.tool.status,
+            purpose: message.tool.purpose,
+          });
         }
+        /*
+         * A step arrived, so the header exists — always, and unconditionally.
+         *
+         * It used to be revealed as a side effect of `startThinking`, which
+         * does nothing once the clock is already running, so the one thing
+         * guaranteeing the log was visible was a call that had usually
+         * already happened. Setting it here means a step can never be
+         * recorded without somewhere to see it.
+         *
+         * The list itself stays folded: the header names the step being run,
+         * which is the live answer to "what is it doing", and the rest is one
+         * click away for whoever wants it.
+         */
+        bubble.group.steps.hidden = false;
+        updateStepsLabel(bubble);
         scroll(was);
         break;
       }
@@ -1971,12 +2454,20 @@
         addUserBubble(item);
       } else if (item.role === "agent") {
         const bubble = ensureAgentBubble();
-        for (const tool of item.tools || []) {
+        const steps = item.tools || [];
+        for (const tool of steps) {
           const row = document.createElement("div");
           row.className = "tool";
-          row.dataset.status = tool.status;
-          row.textContent = `${tool.title} \u2014 ${tool.status}`;
+          renderToolRow(row, tool, "restored");
           bubble.tools.appendChild(row);
+        }
+        if (steps.length > 0) {
+          // Folded, like a turn that has just finished. There is no timing to
+          // show for a chat reopened from storage.
+          bubble.group.steps.hidden = false;
+          // No timing survives in a stored chat, so the sentence stops short.
+          bubble.group.label.textContent =
+            steps.length === 1 ? "Completed 1 step" : `Completed ${steps.length} steps`;
         }
         buffer = item.text || "";
         bubble.body.innerHTML = renderMarkdown(buffer);
@@ -2005,17 +2496,12 @@
   // below has itself been restored, or a panel move can overwrite it empty.
   setMode(currentModeId, false);
 
-  // True when a moved panel restored the user’s own toggle, so the setting
-  // default must not overwrite it.
-  let restoredChoice = false;
   let restored = false;
   if (Array.isArray(saved.history) && saved.history.length > 0) {
     history = saved.history;
     historyTruncated = saved.historyTruncated === true;
-    if (typeof saved.includeSelection === "boolean") {
-      includeSelection = saved.includeSelection;
-      restoredChoice = true;
-    }
+    // `includeSelection` is not restored: it is the setting's to decide, and
+    // the `defaults` message that follows `ready` carries the current value.
     restoreHistory(history);
     restored = true;
   }

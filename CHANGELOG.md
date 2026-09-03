@@ -1,5 +1,262 @@
 # Changelog
 
+## 0.22.2
+
+- **A run of backticks inside a sentence no longer swallows the rest of the reply.** A
+  code fence only opens a block at the start of a line — the renderer matched ``` anywhere,
+  so a sentence like "uses longer fences (\`\`\`\`)", a shell snippet quoted mid-line, or
+  any answer discussing markdown turned everything after it into one enormous code block.
+  The more a reply talked about code, the more likely it was to be destroyed. Both the
+  opening and closing fence are anchored to a line now.
+
+  The unterminated case uses an end-of-*string* assertion rather than `$`, which under the
+  multiline flag means end of line and would cut every block at its first newline — a
+  streaming reply is unterminated for as long as it is arriving.
+
+## 0.22.1
+
+- **Windows line endings no longer break code blocks.** The fence pattern consumed the
+  `\n` after the language but not `\r\n`, so the carriage return was captured as the first
+  character of the code — and `<pre>` renders a lone `\r` as a break. Every snippet in a
+  reply with CRLF endings came out with a blank line above and below it, and because the
+  culprit was invisible whitespace there was nothing on screen to explain it. Line endings
+  are normalised once before anything parses the text, which fixes fences, headings and
+  lists together.
+- A fence indented under a list no longer leaves its indent as a trailing line inside the
+  code, and `` ```js `` followed by a space is recognised.
+
+## 0.22.0
+
+- **Kiro sends its updates under two method names, and one of them was being thrown away.**
+  `session/update` carries `tool_call`, `tool_call_update` and every message chunk;
+  `_kiro.dev/session/update` carries the `tool_call_chunk` — the first word that a step is
+  starting. Only the unprefixed name was accepted, so every one of those was rejected
+  before it reached the handler and merely written to the log as an unknown notification.
+  That is exactly the window in which the panel has nothing to say but "Working…", and it
+  is the longest-feeling part of a turn. Both spellings are accepted now, which is what
+  `_kiro.dev/metadata` already did by naming both.
+
+  Found by capturing a whole turn straight off `kiro-cli acp` and comparing the method
+  names against what the extension accepts. `test/toolSteps.test.js` pins both spellings.
+
+## 0.21.0
+
+- **The log of what Kiro ran is always there, and folded.** The header is now revealed by
+  the step itself rather than as a side effect of the clock starting — which did nothing
+  once the clock was already running, so what guaranteed the log was visible was a call
+  that had usually already happened. A step can no longer be recorded without somewhere to
+  see it. It stays folded: the header names the step being run, and the rest is one click
+  away. A list you open yourself stays open.
+- **The composer row is compact**: 22px instead of 26, with smaller icons and tighter
+  padding. One `:is()` rule hands that height to every control rather than a list naming
+  each one — the old version only held the controls it happened to name, so one moved into
+  a different wrapper would silently go back to sizing itself. Measured at editor font
+  sizes 11, 13 and 16px: attach, workflow, model and send all 22px.
+
+## 0.20.1
+
+- **One shape for the steps header.** A turn that ran no steps had a second version of that
+  line — the chevron slot standing empty, because there was nothing to unfold, sitting at a
+  different indent from the ordinary one. Neither was wrong on its own; together they read
+  as a mistake. That version is gone: a turn with no steps shows no header, so every header
+  in the transcript looks the same.
+- **Your bubble stops short of the left margin.** At the full width it was a paragraph
+  again; the strip of ground down its left is what says somebody sent it. Long questions
+  still get almost all the room.
+- **The send arrow points straight right** — no tilt, no paper plane.
+
+Also measured while checking the row: every control in it holds 26px at editor font sizes
+from 11px to 18px.
+
+## 0.20.0
+
+- **You can watch Kiro work again.** The steps list is open while the turn is running and
+  folds itself away when the turn ends — the actions were still being recorded, but behind
+  a closed fold, which hid exactly the part that answers "what is it doing". Open or close
+  it yourself at any point and that choice sticks for the rest of the turn.
+- **Your question is a bubble on the right**, sized to what you typed and growing to the
+  full width when it needs it. Both roles ran the full width before, which made a one-line
+  question read as another paragraph of the conversation rather than as the thing that
+  started the exchange.
+- **More air between exchanges** than between a question and its own answer, so a long
+  conversation reads as a stack rather than one undifferentiated column.
+- **One bad notification no longer costs the rest of its batch.** Kiro often writes several
+  notifications in a single stdio write, and a throw in any handler abandoned the loop that
+  walks them — every message after it in that write was dropped silently, looking exactly
+  like Kiro never having sent it. Each is now handled on its own and a failure is logged.
+
+## 0.19.0
+
+The row under the message box.
+
+- **Everything in it is one height.** The controls were sized three different ways — the
+  attach button by fixed pixels, the pickers by their own padding, Send by the global
+  button padding — so nothing lined up. One `--control-h` now feeds all four.
+- **Send and Stop are icons**: a paper plane and a square, both labelled for screen
+  readers and both the same 26px square as the attach button. Send keeps the accent
+  colour; it is the only thing in the row that has it.
+- **The pickers lead with an icon instead of trailing a chevron.** The chevron said only
+  "this opens" — which a click discovers anyway — while costing width in a panel that has
+  none to spare, and it made the two pickers read as a pair of form fields rather than
+  part of the same row of controls.
+
+## 0.18.1
+
+- **A finished turn reads as one sentence**: `Completed 2 steps in 7s`. While the turn is
+  running the two halves stay separate — what it is doing on the left, the clock on the
+  right — because those are two different things; once it is over it is a single fact, and
+  splitting it left a label with a stray number after it. The "Worked for" wording is gone.
+- **The ticks are gone from the step list.** A green ✓ beside every finished row was a
+  column of decoration repeating what the header already said. The only step that gets a
+  mark now is the one still running, and a failure is carried by the row's own colour.
+
+## 0.18.0
+
+Steps, measured against what kiro-cli 2.20.2 actually sends rather than guessed at.
+
+- **The first notification for a step was being thrown away.** Kiro announces a step three
+  times: `tool_call_chunk` the moment it decides to use a tool, then `tool_call` with a
+  real title, then `tool_call_update` with the outcome. Only the last two were handled, so
+  nothing appeared until Kiro had worked out what to call the step — the panel sat on
+  "Working…" through the whole of that gap.
+- **A step no longer shows up as `read`.** That first notification's title is only the
+  tool's kind, so it now reads `Reading`, `Searching`, `Editing`, `Running` until the real
+  title arrives and replaces it.
+- **Each step says why Kiro is running it.** Kiro sends its own note — "Read package.json
+  to get the version string." — which is the part worth unfolding the list for: the title
+  says what, this says what for.
+- **Steps are written to the log.** There was no record of them at all, so a turn that
+  showed no steps could not be told from one that ran none. `Kiro Chat: Show Log` now has
+  a `[tool]` line per update.
+
+## 0.17.1
+
+- **The sent message no longer names the same file twice.** A message sent with a
+  highlight carried both `media/chat.js` and `media/chat.js:23-27` under it — the second
+  says everything the first did. Only the range survives, named the way the chips are:
+  the file's name, with the whole path in the tooltip. This is the same fix 0.15.1 made to
+  the chip row above the box; the transcript had its own copy of the problem.
+- **Code blocks take the editor's background.** `textCodeBlock` is a faint wash meant to
+  sit inside prose, and against the sidebar it was nearly invisible — the block read as
+  more paragraph. It is now the colour the code would have in a tab: clearly darker than
+  the sidebar on a dark theme, clearly lighter on a light one.
+- `Worked for 0s` no longer appears over a reply that came straight back. The line is
+  worth a row only when the turn ran long enough to wonder about.
+- **The working line says what Kiro is doing**, not just that it is doing something —
+  `Reading src/kiroSession.ts`, `Searching for readUsage in src`, `Editing chat.js` — with
+  the elapsed time beside it, updating as each step starts. It falls back to `Working…`
+  before the first step, and becomes `3 steps` once the turn is over. The full list is
+  still one click away on the same line, and still closed by default.
+
+## 0.17.0
+
+- **The turn shows its elapsed time, and the steps fold away.** One line — `Working… 14s`
+  with a turning ring — sits where the answer will appear and keeps counting while the
+  reply streams, which is the thing that tells a slow turn from a stuck one. The tool
+  steps are behind it, closed; click to open them. When the turn ends the line becomes
+  `3 steps · 14s`, still closed.
+- **No ticks while the work is going on.** A column of them piling up beside steps still
+  running was noise, and the row that matters is the one still going. The marks appear
+  once the turn is over. A failure is always marked.
+- **The blinking `▌` no longer stands in for a reply.** It appeared as soon as the first
+  chunk arrived, even an empty one, so a turn that had not really started showed a bare
+  cursor on an empty line. It waits for text now, and `Working…` holds the place.
+- **Code blocks are syntax coloured, following your theme.** VS Code does not hand a
+  webview the editor's TextMate token colours, so this cannot be identical to the editor.
+  What it does expose is the theme's own colour keys for the same ideas, and comments,
+  strings, numbers, keywords and function names are coloured from those — so the block
+  moves with whatever theme you are running rather than fighting it. Light and dark both
+  have sensible fallbacks for a theme that leaves a key undefined.
+- **The copy button is smaller and has lost its border** — just the glyph, taking a ground
+  only under the pointer.
+
+## 0.16.0
+
+The transcript.
+
+- **The panel says when Kiro is working.** Between pressing Send and the first token —
+  however long Kiro spends thinking and running tools — the transcript said nothing at
+  all, so a slow turn was indistinguishable from a dead one. The only sign was the status
+  dot at the very top of the panel, nowhere near where the answer appears. A "Working…"
+  line now goes in the moment the message is sent, where the reply will land, and the
+  reply replaces it.
+- **Tool steps show their state.** "Reading chat.js — running" put the state in the same
+  grey prose as the name, so a step still going looked like one that had finished. Each
+  row now carries a turning ring, a green tick or a red cross. A reopened chat shows
+  finished marks rather than spinning over a turn that ended last week.
+- **Code blocks have a copy button.** It sits in the top-right of the block, appears on
+  hover or keyboard focus, and turns into a green tick when the code is on the clipboard.
+  Where a policy blocks the clipboard outright it selects the code instead and says to
+  press Ctrl+C, rather than looking like a button that did nothing.
+- **Your own message is a block now.** Both turns were plain full-width prose separated
+  only by a small uppercase label, and the question was painted in the *muted* colour — so
+  your own words were the faintest thing on screen and scrolling back through a long chat
+  gave the eye nothing to catch on. The question sits on its own quiet surface at full
+  contrast; the answer stays plain prose, which is what long text wants in a narrow
+  column.
+- The blinking cursor no longer appears on an empty reply, where it claimed a reply had
+  started before the first token arrived. Both new animations stop entirely under
+  `prefers-reduced-motion` — the words and marks carry the state without them.
+
+## 0.15.1
+
+- **The selection chip cannot be dismissed any more.** Its × switched off sending the
+  highlighted code while the code stayed visibly highlighted in the editor — two places
+  disagreeing about the same thing, with nothing on screen saying which was true. The chip
+  reports the highlight now; clearing the highlight is what stops it being sent, which is
+  the editor's job. `kiroChat.sendSelection` remains the switch for turning the whole
+  behaviour off, and is now the only thing that decides it.
+- **Chips show the file's name, not its path.** `media/chat.js:26-26` spent most of a
+  narrow sidebar on a folder you are already working in; it reads `chat.js:26-26`, with
+  the full path in the tooltip. Nothing sent to Kiro changes — it still gets the full path.
+- **Chips got their hover back.** They were solid badge-grey blocks — colours meant for a
+  count on a tab — with no state of their own, so a chip you can click to open a file
+  looked exactly like one you cannot, and the × had only an opacity nudge to show it was
+  live. Chips are now a bordered surface; the ones that open a file lift under the
+  pointer, and the × is a real 18px target that turns red.
+
+## 0.15.0
+
+The chip row, and a review of what Kiro is actually sent.
+
+- **One chip for a highlighted selection.** A selection always comes from the file you are
+  looking at, so the row named the same file twice — `media/chat.js` beside
+  `media/chat.js:26-26  1 line`. It is now just `⌗ media/chat.js:26-26`; the range already
+  says how many lines it is. Switch the selection off and the file chip comes back, since
+  then it is the only thing still being sent.
+
+Three ways Kiro was being told the wrong thing, found by reviewing that path:
+
+- **Selecting inside a diff sent a path that exists nowhere.** The change-review tab is a
+  document like any other, so clicking in it — which is how its keyboard shortcuts are
+  used — made it the active editor, and the next message told Kiro "I am looking at
+  `/a1b2c3/chat.js (Working Tree)`". Selections are now only read from real files;
+  git's read-only sides, search results and output panes are ignored for the same reason.
+- **Selected code containing ``` escaped its own code block.** Markdown ends a fenced
+  block at the first line with as many backticks as opened it, so highlighting a markdown
+  file, a template literal or a docstring spilled the rest of the message out of the
+  block — Kiro read the user's code as prose. The fence is now always longer than the
+  longest run of backticks in the selection.
+- **A selection cut at 12,000 characters claimed to be whole.** Kiro was told "lines 26 to
+  480" over a block holding only the first part, so an answer about the end of the
+  selection was about code it never saw. It now says how much it was given.
+
+`buildBlocks` and the selection rules moved to `src/promptBlocks.ts`, free of `vscode` so
+they can be tested directly. None of this had a test before.
+
+## 0.14.2
+
+- **Past chats no longer flash blue when you point at a row.** The row already tints on
+  hover; the blue was the global button style leaking through on top of it. A row's
+  clickable area is a `<button>`, and while it cancels the button background it could not
+  cancel `button:hover` — a type plus a pseudo-class outranks a single class — so the
+  whole row repainted in the primary colour under the pointer. The same leak was fixed on
+  attachment chips, and a test now fails for any plain-looking button that cancels the
+  background without also cancelling the hover.
+- **The "Ask in VS Code Chat" button is gone from the title bar.** It opened VS Code's own
+  chat with `@kiro` typed, which is the only box that accepts a dragged file — still there
+  in the command palette, just no longer taking up a slot in the title bar.
+
 ## 0.14.1
 
 - **The past-chats list is quieter.** The "New chat" button is gone — the title bar

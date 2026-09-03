@@ -11,6 +11,7 @@ const css = fs.readFileSync(path.join(root, "media", "chat.css"), "utf8");
 const js = fs.readFileSync(path.join(root, "media", "chat.js"), "utf8");
 const provider = fs.readFileSync(path.join(root, "src", "chatViewProvider.ts"), "utf8");
 const reviewer = fs.readFileSync(path.join(root, "src", "changeReviewer.ts"), "utf8");
+const manifest = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
 
 test("chat.js is valid JavaScript", () => {
   assert.doesNotThrow(() => new vm.Script(js, { filename: "chat.js" }));
@@ -61,13 +62,70 @@ test("the hidden attribute wins over our own display rules", () => {
     );
   }
 
-  // The override has to sit above the component rules it is undoing.
+  // The override has to sit above the component rules it is undoing. `.icon`
+  // joined this list when Stop became an icon button: it is toggled with
+  // `hidden` and now carries `display: inline-flex`.
   const overrideAt = css.indexOf(override[0]);
-  for (const selector of [".chips {", ".usage-bar {", ".dropzone {", ".popup {", ".usage-panel {"]) {
+  for (const selector of [
+    ".chips {",
+    ".usage-bar {",
+    ".dropzone {",
+    ".popup {",
+    ".usage-panel {",
+    ".icon {",
+  ]) {
     const at = css.indexOf(selector);
     assert.ok(at > -1, `${selector} should exist`);
     assert.ok(at > overrideAt, `${selector} must come after the [hidden] override`);
   }
+  assert.match(js, /stopBtn\.hidden = /, "Stop is toggled with the hidden attribute");
+});
+
+/*
+ * The row was sized three different ways — the attach button by fixed pixels,
+ * the pickers by their own padding, Send by the global button padding — so
+ * nothing in it lined up.
+ */
+test("every control in the composer row is one height", () => {
+  assert.match(css, /\.composer-row \{[^}]*--control-h: \d+px/);
+  /*
+   * One selector covering every control, not a list of paths to each of them.
+   * The enumerated version only held the controls it happened to name, so one
+   * moved into a different wrapper would quietly drop out and go back to
+   * sizing itself.
+   */
+  const rule = css.match(/\.composer-row :is\(([^)]*)\) \{([^}]*)\}/);
+  assert.ok(rule, "the row has to hand its height to every control at once");
+  for (const cls of [".icon", ".mode-btn", ".model-btn"]) {
+    assert.ok(rule[1].includes(cls), `${cls} must be covered by that one rule`);
+  }
+  assert.match(rule[2], /height: var\(--control-h\)/);
+  assert.match(rule[2], /min-height: var\(--control-h\)/, "so content cannot push one taller");
+
+  // Square: the icon buttons take their width from the same number.
+  assert.match(css, /^\.icon \{[^}]*width: var\(--control-h/m);
+});
+
+/*
+ * A chevron on the right said only "this opens", which a click discovers
+ * anyway, while costing width in a panel that has none to spare. The icon
+ * leads instead, and it says which picker this is.
+ */
+test("the pickers lead with an icon and Send and Stop are icons", () => {
+  const row = provider.slice(provider.indexOf('<div class="composer-row">'));
+  const markup = row.slice(0, row.indexOf("</div>\n  </form>"));
+  assert.doesNotMatch(markup, /class="caret"/, "no chevrons in the composer row");
+  assert.match(markup, /<svg class="btn-icon"[\s\S]*?<span id="mode-label">/, "icon before label");
+  assert.match(markup, /<svg class="btn-icon"[\s\S]*?<span id="model-label">/);
+
+  // A button with no text needs a name for anyone not looking at it.
+  for (const id of ["send", "stop"]) {
+    const button = markup.slice(markup.indexOf(`id="${id}"`));
+    assert.match(button.slice(0, 400), /aria-label="/, `#${id} must be labelled`);
+    assert.match(button.slice(0, 400), /<svg /, `#${id} must be an icon`);
+  }
+  assert.doesNotMatch(markup, />Send</, "Send is no longer a word");
+  assert.doesNotMatch(markup, />Stop</);
 });
 
 test("each toggled element has exactly one rule block", () => {
@@ -75,6 +133,473 @@ test("each toggled element has exactly one rule block", () => {
     const matches = css.match(new RegExp(`^\\${selector} \\{`, "gm")) ?? [];
     assert.equal(matches.length, 1, `${selector} is defined ${matches.length} times`);
   }
+});
+
+/*
+ * Every plain-looking button has to cancel the global button hover as well as
+ * the global button background.
+ *
+ * `button { background: var(--vscode-button-background) }` is undone by a
+ * class rule, but `button:hover` is a type plus a pseudo-class — specificity
+ * (0,1,1) — and beats any single class. So a button that only sets
+ * `background: none` sits transparent at rest and then paints solid primary
+ * blue the moment the pointer crosses it. That has now shipped three times:
+ * the usage strip, the review summary line, and the past-chats rows, where it
+ * covered the row's own hover tint with a blue slab.
+ */
+test("a button styled to look plain cancels the global hover too", () => {
+  // Comments sit between rules, so they land in the selector unless dropped.
+  const rules = [...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^}]*)\}/g)];
+  const hovered = new Set();
+  const plain = [];
+  for (const [, rawSelector, body] of rules) {
+    for (const selector of rawSelector.split(",").map((s) => s.trim().replace(/\s+/g, " "))) {
+      if (selector.includes(":hover")) hovered.add(selector.replace(":hover", ""));
+      // Only the ones that are buttons; `background: none` on a <code> block
+      // has no global rule to fight.
+      if (/background:\s*none/.test(body) && /border:\s*none/.test(body)) {
+        plain.push(selector);
+      }
+    }
+  }
+  assert.ok(plain.length >= 4, `expected several plain buttons, found ${plain.length}`);
+  const missing = plain.filter((selector) => !hovered.has(selector));
+  assert.deepEqual(
+    missing,
+    [],
+    `these paint solid blue on hover because nothing outranks button:hover: ${missing.join(", ")}`
+  );
+});
+
+/*
+ * A selection always comes from the file you are looking at, so while one is
+ * being sent the chip row named the same file twice — "media/chat.js" beside
+ * "media/chat.js:26-26  1 line". The narrower chip says everything the
+ * broader one did, so it stands for both; switch the selection off and the
+ * file chip comes back, because then it is the only thing still going.
+ */
+test("the file chip and the selection chip do not both name the same file", () => {
+  assert.match(
+    js,
+    /const selectionCoversActiveFile =\s*\n?\s*selection && selection\.hasSelection && includeSelection/,
+    "the selection chip has to stand in for the file chip"
+  );
+  const render = js.slice(js.indexOf("function renderChips()"));
+  const body = render.slice(0, render.indexOf("\n  function "));
+  assert.match(body, /if \(selectionCoversActiveFile\) \{/, "which suppresses the file chip");
+  assert.doesNotMatch(body, /chip-count/, "the range already says how many lines it is");
+  assert.doesNotMatch(body, /lineCount/);
+  assert.doesNotMatch(css, /\.chip-count/, "and the rule for it is gone too");
+  assert.doesNotMatch(provider, /lineCount:/, "so the provider need not send it");
+
+  // A sidebar is narrow, and the folder is one the user is already in.
+  assert.match(js, /function fileName\(pathish\)/, "chips show the name, not the path");
+  assert.match(body, /fileName\(selection\.relativePath\)/);
+  assert.match(body, /fileName\(activeFile\.label\)/);
+
+  /*
+   * And the same in the sent message, which had its own copy of the problem:
+   * a message sent with a highlight carried both "media/chat.js" and
+   * "media/chat.js:23-27" under it — the same file twice, one of them saying
+   * strictly less.
+   */
+  const bubble = js.slice(js.indexOf("function addUserBubble(message)"));
+  const tags = bubble.slice(0, bubble.indexOf("messagesEl.appendChild(node)"));
+  assert.match(tags, /samePathish\(a\.label, selected\)/, "the range stands in for the file");
+  assert.match(tags, /replace\(\/:\\d\+-\\d\+\$\/, ""\)/, "which means stripping the range off");
+  assert.match(tags, /fileName\(a\.label\)/, "and both are named, not pathed");
+  assert.match(tags, /fileName\(selected\)/);
+});
+
+/*
+ * The selection chip reports the highlight; it is not a control.
+ *
+ * Its × switched off sending the highlighted code, which left the editor
+ * showing a selection the panel had quietly decided not to send — two places
+ * disagreeing, with nothing on screen saying which was true. Clearing the
+ * highlight is the one way to stop it, and that is the editor's job.
+ */
+test("the selection chip cannot be dismissed while the code is highlighted", () => {
+  const render = js.slice(js.indexOf("function renderChips()"));
+  const body = render.slice(0, render.indexOf("\n  function "));
+  // These files are CRLF, so slice on a pattern rather than a literal newline.
+  const from = body.search(/if \(selectionCoversActiveFile\) \{\s*\n\s*const chip/);
+  assert.ok(from > -1, "the selection chip block should be findable");
+  const chip = body.slice(from);
+  const to = chip.search(/for \(const a of attachments\)/);
+  assert.ok(to > -1, "and it should end before the attachment chips");
+  const upToNext = chip.slice(0, to);
+  assert.doesNotMatch(upToNext, /chip-x/, "the selection chip must carry no dismiss button");
+  assert.doesNotMatch(upToNext, /includeSelection = false/);
+  assert.doesNotMatch(body, /includeSelection = true/, "and no add-it-back chip either");
+
+  // With no per-message choice left, the setting is the only thing deciding.
+  assert.doesNotMatch(js, /restoredChoice/, "a restored panel has no choice to protect");
+  assert.match(
+    js,
+    /if \(typeof message\.sendSelection === "boolean"\) \{/,
+    "so the setting always wins"
+  );
+  assert.doesNotMatch(
+    manifest.contributes.configuration.properties["kiroChat.sendSelection"].description,
+    /per message using the chip/,
+    "and the setting must not promise a toggle that is gone"
+  );
+});
+
+/*
+ * A code block you cannot get out of the panel is half a code block.
+ *
+ * The button has to be wired by delegation: a streaming reply rebuilds its
+ * markdown on every frame, so a listener bound to the button itself would be
+ * thrown away several times a second and the control would go dead mid-reply.
+ */
+test("code blocks can be copied", () => {
+  assert.match(js, /class="code-block"/, "the block needs a wrapper to position on");
+  assert.match(js, /class="code-copy"/);
+  assert.match(css, /^\.code-block \{[^}]*position: relative/m);
+  assert.match(css, /^\.code-copy \{/m);
+
+  assert.match(
+    js,
+    /messagesEl\.addEventListener\("click"/,
+    "the copy must be delegated from the transcript, not bound per button"
+  );
+  const handler = js.slice(js.indexOf('messagesEl.addEventListener("click"'));
+  const body = handler.slice(0, handler.indexOf("\n  });"));
+  assert.match(body, /closest\(["']\.code-copy["']\)/);
+  // Reading the rendered element means what is copied is what is on screen,
+  // with no second escaping pass to get wrong.
+  assert.match(body, /querySelector\("code"\)/);
+  assert.match(body, /copyText\(code\.textContent\)/);
+  assert.match(body, /isConnected/, "a mid-render button must not be written to");
+
+  // Something has to happen when the clipboard is refused, or the button
+  // looks broken.
+  assert.match(body, /selectNodeContents\(code\)/, "failing over to a selection");
+  assert.match(js, /document\.execCommand\("copy"\)/, "and to the older API");
+
+  // Hover is not the only way to reach it.
+  assert.match(css, /\.code-copy:focus-visible/);
+});
+
+/*
+ * Between pressing Send and the first token — however long Kiro spends
+ * thinking and running tools — the transcript said nothing at all, so a slow
+ * turn was indistinguishable from a dead one. The only sign was the status
+ * dot at the very top of the panel, nowhere near where the answer lands.
+ */
+/*
+ * Windows line endings used to leave a carriage return inside every code
+ * block. The fence pattern consumed `\n` after the language but not `\r\n`,
+ * so the `\r` was captured as the first character of the code — and `<pre>`
+ * renders a lone `\r` as a break, so every snippet came out with a blank line
+ * above and below it that was not even visibly whitespace.
+ */
+test("code blocks survive Windows line endings", () => {
+  const render = js.slice(js.indexOf("function renderMarkdown(rawSource)"));
+  const body = render.slice(0, render.indexOf("\n  // ---"));
+  assert.match(
+    body,
+    /String\(rawSource\)\.replace\(\/\\r\\n\?\/g, "\\n"\)/,
+    "line endings must be normalised before anything parses the text"
+  );
+  // The newline before a closing fence belongs to the fence, and so does any
+  // indent in front of it.
+  assert.match(body, /code\.replace\(\/\\n\[ \\t\]\*\$\/, ""\)/);
+});
+
+/*
+ * A fence only opens a block at the start of a line.
+ *
+ * Matching ``` anywhere meant a run of backticks *inside a sentence* — "uses
+ * longer fences (````)", a shell snippet quoted inline, anything discussing
+ * markdown — opened a code block and swallowed the whole rest of the reply
+ * into it as code. The more a reply talked about code, the more likely it was
+ * to be destroyed.
+ */
+test("backticks inside a sentence do not open a code block", () => {
+  const render = js.slice(js.indexOf("function renderMarkdown(rawSource)"));
+  const body = render.slice(0, render.indexOf("\n  // ---"));
+  const fence = body.match(/const FENCE = (\/.*\/gm);/);
+  assert.ok(fence, "the fence pattern should be named and anchored");
+
+  assert.match(fence[1], /^\/\^\[ \\t\]\{0,3\}```/, "the opening fence must start a line");
+  assert.match(fence[1], /\^\[ \\t\]\{0,3\}```\[ \\t\]\*\$/, "and so must the closing one");
+  assert.ok(fence[1].endsWith("/gm"), "which needs the multiline flag");
+
+  /*
+   * `$` under `m` means end of *line*, so using it for the unterminated case
+   * would cut every block at its first newline — and a streaming reply is
+   * unterminated for as long as it is arriving.
+   */
+  assert.match(fence[1], /\(\?!\[\\s\\S\]\)/, "end-of-string, not end-of-line");
+
+  // Exercise it, so the assertions above are about behaviour and not shape.
+  const pattern = new RegExp(fence[1].slice(1, -3), "gm");
+  const inline = "uses longer fences (````)\n3. next item\n4. another";
+  assert.equal(pattern.test(inline), false, "a mid-line run of backticks is not a fence");
+  pattern.lastIndex = 0;
+  assert.equal(pattern.test("```js\nlet a = 1;\n```"), true, "a real fence still opens");
+  pattern.lastIndex = 0;
+  assert.equal(pattern.test("```js\nlet a = 1;"), true, "and an unfinished one still renders");
+});
+
+test("the transcript says when Kiro is working, and for how long", () => {
+  assert.match(js, /function startThinking\(\)/);
+  assert.match(js, /function stopThinking\(/);
+  assert.match(js, /function elapsedText\(ms\)/, "a stuck turn is told from a slow one by time");
+  assert.match(css, /^\.steps-time \{/m);
+
+  const sent = js.slice(js.indexOf('case "userMessage":'));
+  assert.match(
+    sent.slice(0, 400),
+    /startThinking\(\)/,
+    "it must go in when the message is sent, not when the reply starts"
+  );
+
+  // The clock has to keep running while the reply streams — that is the whole
+  // point of it — so only the end of the turn stops it.
+  const start = js.slice(js.indexOf("function startThinking()"));
+  assert.match(start.slice(0, 800), /setInterval\(tick, 1000\)/);
+  const chunk = js.slice(js.indexOf('case "chunk": {'));
+  assert.doesNotMatch(
+    chunk.slice(0, 500),
+    /stopThinking/,
+    "the first token does not mean the turn is over"
+  );
+  const finish = js.slice(js.indexOf("function finishAgentBubble()"));
+  assert.match(finish.slice(0, 400), /stopThinking\(current\)/, "turnEnd and errors do");
+  assert.match(finish.slice(0, 400), /clearInterval/, "a discarded bubble must not tick on");
+
+  // An empty bubble showing a blinking cursor claims a reply has begun.
+  const bubble = js.slice(js.indexOf("function ensureAgentBubble()"));
+  assert.doesNotMatch(
+    bubble.slice(0, 900),
+    /body\.className = "body cursor"/,
+    "the cursor belongs to text that exists"
+  );
+  assert.match(
+    chunk.slice(0, 500),
+    /classList\.toggle\("cursor", Boolean\(buffer\.trim\(\)\)\)/,
+    "and not to an empty buffer"
+  );
+
+  // Decoration only: the words carry the state on their own.
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\)/);
+});
+
+/*
+ * A turn can run a dozen tools, and listing them all pushed the answer off
+ * the screen before it arrived. They fold behind one line of state.
+ */
+/*
+ * "Working…" does not answer the question you actually have while waiting,
+ * which is *what is it doing* — reading a file, searching, writing one. The
+ * newest unfinished step is the answer, and it goes on the same line the list
+ * unfolds from rather than costing a second one.
+ */
+test("the header names the step Kiro is on", () => {
+  assert.match(js, /function updateStepsLabel\(bubble\)/);
+  const update = js.slice(js.indexOf("function updateStepsLabel(bubble)"));
+  const body = update.slice(0, update.indexOf("\n  /**"));
+  assert.match(body, /steps\.length === 0/, "before any step it is still Working…");
+  assert.match(
+    body,
+    /\.reverse\(\)\s*\n?\s*\.find\(\(t\) => t\.status !== "completed" && t\.status !== "failed"\)/,
+    "the newest unfinished step is the one being worked on"
+  );
+  assert.match(body, /head\.title = step\.title/, "the line ellipsises, so keep the whole of it");
+
+  const tool = js.slice(js.indexOf('case "tool": {'));
+  const handler = tool.slice(0, tool.indexOf('case "permission"'));
+  assert.match(handler, /updateStepsLabel\(bubble\)/, "every tool update refreshes it");
+  assert.match(
+    handler,
+    /startThinking\(\)/,
+    "a tool can arrive without a userMessage, so the header starts here too"
+  );
+});
+
+/*
+ * A finished turn is a single fact, so it reads as one sentence — "Completed
+ * 2 steps in 7s". While the turn runs the halves are separate, because what
+ * it is doing and how long it has been at it are two different things; once
+ * it is over, splitting them left a label with a stray number after it.
+ */
+test("a finished turn reads as one sentence", () => {
+  const stop = js.slice(js.indexOf("function stopThinking(bubble)"));
+  const body = stop.slice(0, stop.indexOf("\n  /**"));
+  assert.match(body, /`Completed \$\{steps\}\$\{took_\}`/);
+  assert.match(body, /group\.time\.textContent = ""/, "the clock half is folded in");
+  assert.doesNotMatch(js, /Worked for/, "that wording is gone for good");
+
+  /*
+   * A turn that ran no steps shows no header. There used to be a second shape
+   * for that case — a line with the chevron slot standing empty, at a
+   * different indent from the ordinary one — and two versions of the same
+   * line read as a mistake.
+   */
+  assert.match(body, /if \(count === 0\) \{[\s\S]*?group\.steps\.hidden = true;[\s\S]*?return;/);
+  assert.doesNotMatch(js, /classList\.add\("bare"\)/, "the second shape is gone");
+  assert.doesNotMatch(css, /\.steps\.bare/);
+
+  // A stored chat has no timing, so the sentence stops short rather than
+  // claiming a duration it does not have.
+  const restore = js.slice(js.indexOf("function restoreHistory(saved)"));
+  assert.match(restore.slice(0, 1400), /"Completed 1 step" : `Completed \$\{steps\.length\} steps`/);
+});
+
+test("the steps fold away behind the header", () => {
+  assert.match(js, /function buildSteps\(\)/);
+  assert.match(css, /^\.steps-head \{/m);
+  assert.match(css, /^\.steps-list \{/m);
+  const build = js.slice(js.indexOf("function buildSteps()"));
+  const body = build.slice(0, build.indexOf("\n  /**"));
+  assert.match(body, /list\.hidden = true/, "closed to begin with");
+  assert.match(body, /aria-expanded/, "and it has to say so");
+
+  /*
+   * The header must exist whenever a step ran — that is the log of what Kiro
+   * did, and it is the one thing that must never go missing. It used to be
+   * revealed as a side effect of `startThinking`, which does nothing once the
+   * clock is already running, so what guaranteed the log was visible was a
+   * call that had usually already happened.
+   */
+  const tool = js.slice(js.indexOf('case "tool": {'));
+  const handler = tool.slice(0, tool.indexOf('case "permission"'));
+  assert.match(handler, /bubble\.group\.steps\.hidden = false;/);
+  assert.doesNotMatch(handler, /group\.open\(true\)/, "but it stays folded by default");
+
+  // Nothing folds a list the user opened; that choice is theirs to undo.
+  assert.match(body, /steps\.dataset\.pinned = "1"/);
+  const stop = js.slice(js.indexOf("function stopThinking(bubble)"));
+  const stopBody = stop.slice(0, stop.indexOf("\n  /**"));
+  assert.doesNotMatch(stopBody, /group\.open\(/, "the turn ending must not close it either");
+  assert.match(stopBody, /group\.steps\.hidden = false/, "and the log survives the turn");
+
+  // A permission card inside a folded list is one the user cannot answer,
+  // and the turn would hang waiting for them.
+  const card = js.slice(js.indexOf("function addPermissionCard(permission)"));
+  assert.match(
+    card.slice(0, 2200),
+    /root\.insertBefore\(card, bubble\.body\)/,
+    "the permission card must never go inside the steps list"
+  );
+});
+
+/*
+ * "Reading chat.js — running" wrote the state in the same grey prose as the
+ * name, so a step still going looked like one that had finished. Live and
+ * restored rows go through one renderer, or the two drift.
+ */
+test("a tool row shows its state, without a column of ticks mid-turn", () => {
+  assert.match(js, /function renderToolRow\(row, tool, phase = "live"\)/);
+  assert.match(css, /^\.tool-icon \{/m);
+  assert.match(css, /@keyframes tool-spin/);
+
+  // No marks on finished steps: a tick beside every completed row is a column
+  // of decoration saying the same thing over and over. Only the step still
+  // running gets a glyph, and a failure is carried by the row's colour.
+  const render = js.slice(js.indexOf('function renderToolRow(row, tool, phase = "live")'));
+  const body = render.slice(0, render.indexOf("\n  function "));
+  assert.doesNotMatch(body, /✓|✗|"·"/, "steps carry no marks of their own");
+  assert.match(body, /icon\.textContent = ""/);
+  assert.match(body, /if \(!done && !failed && live\) icon\.classList\.add\("spinning"\)/);
+  assert.match(css, /\.tool\[data-status="failed"\] \{[^}]*errorForeground/);
+  // The slot keeps its width, or a row jumps sideways as its step finishes.
+  assert.match(css, /^\.tool-icon \{[^}]*width: 9px/m);
+
+  const restore = js.slice(js.indexOf("function restoreHistory(saved)"));
+  assert.match(
+    restore.slice(0, 1100),
+    /renderToolRow\(row, tool, "restored"\)/,
+    "a chat from last week is not still working"
+  );
+});
+
+/*
+ * VS Code does not hand a webview the editor's TextMate token colours, so an
+ * exact match is not on offer. The theme's own colour keys for the same ideas
+ * are, and colouring from those follows whatever theme is running rather than
+ * hard-coding a palette that fights it.
+ */
+test("code blocks are coloured from the active theme", () => {
+  assert.match(js, /function highlightCode\(code, lang\)/);
+  assert.match(js, /highlightCode\(\s*\n?\s*code\.replace/, "the renderer has to use it");
+  for (const token of ["comment", "string", "number", "const", "keyword", "fn"]) {
+    assert.match(css, new RegExp(`^\\.tok-${token} \\{`, "m"), `.tok-${token} needs a colour`);
+  }
+  // Every colour comes from the theme, with a fallback only for a theme that
+  // leaves the key undefined.
+  const tokens = css.slice(css.indexOf(".tok-comment {"), css.indexOf(".tools {"));
+  for (const line of tokens.split("\n")) {
+    if (!/^\s*color:/.test(line)) continue;
+    assert.match(line, /var\(--vscode-/, `a hard-coded token colour would fight the theme: ${line}`);
+  }
+
+  // The bare fallbacks are dark-theme values and would be unreadable on a
+  // light one, so a light theme gets its own set.
+  assert.match(css, /body\.vscode-light \.tok-string/);
+  assert.match(css, /body\.vscode-light \.tok-keyword/);
+
+  // `//` is floor division in Python and `#` is a colour in CSS, so the
+  // comment style must follow the language rather than trying to be both.
+  assert.match(js, /HASH_COMMENT_LANGS/);
+
+  // Everything still goes through escapeHtml, or a reply could inject markup.
+  const highlight = js.slice(js.indexOf("function highlightCode(code, lang)"));
+  const fn = highlight.slice(0, highlight.indexOf("\n  function renderMarkdown"));
+  assert.doesNotMatch(
+    fn,
+    /\$\{match\[0\]\}|\$\{code\.slice/,
+    "raw source must never reach the output unescaped"
+  );
+  assert.match(fn, /escapeHtml\(code\.slice\(last, match\.index\)\)/);
+  assert.match(fn, /const text = escapeHtml\(match\[0\]\)/);
+});
+
+/*
+ * Both turns were plain full-width prose separated by a 10px label, and the
+ * question was painted in the *muted* colour — so the user's own words were
+ * the faintest thing on screen, and scrolling back gave the eye nothing to
+ * catch on.
+ */
+test("your own message is a block, at full contrast", () => {
+  const user = css.slice(css.indexOf(".msg.user {"));
+  const rule = user.slice(0, user.indexOf("}"));
+  assert.doesNotMatch(
+    rule,
+    /color: var\(--vscode-descriptionForeground\)/,
+    "the question must not be dimmer than the answer"
+  );
+  assert.match(rule, /background:/, "it needs a surface to read as a block");
+
+  /*
+   * And sized to what was typed, pushed to the right. Stretched to the full
+   * width a one-line question read as another paragraph of the conversation
+   * rather than as the thing that started it.
+   */
+  assert.match(rule, /align-self: flex-end/);
+  assert.match(rule, /width: fit-content/);
+  // Never the whole width: a bubble reaching both margins is a paragraph
+  // again, and the strip of ground down its left is what says who sent it.
+  const max = rule.match(/max-width: (\d+)%/);
+  assert.ok(max, "the bubble needs a maximum width");
+  assert.ok(
+    Number(max[1]) >= 70 && Number(max[1]) < 100,
+    `expected most of the width but not all of it, got ${max[1]}%`
+  );
+
+  // A new exchange gets more air than the gap inside one.
+  assert.match(css, /\.msg\.user:not\(:first-child\) \{[^}]*margin-top:/);
+
+  const add = js.slice(js.indexOf("function addUserBubble(message)"));
+  assert.doesNotMatch(
+    add.slice(0, 500),
+    /roleLabel\("You"\)/,
+    "the block says whose turn it is, so the label is a wasted line"
+  );
 });
 
 test("the menus are anchored inside a positioned parent", () => {
@@ -125,35 +650,38 @@ test("usage is offered by the view title bar and not duplicated in the top bar",
   assert.match(provider, /case "refreshUsage"/, "the provider must still answer refreshUsage");
 });
 
-/**
- * The panel is one vertical column: status at the top, the conversation
- * flowing top to bottom, the composer pinned at the bottom. User messages used
- * to be right-aligned bubbles, which gave the transcript two reading axes and
- * made a narrow sidebar feel cramped. Both roles are now full width.
+/*
+ * The question is a bubble on the right; the answer is prose down the left.
+ *
+ * This reverses an earlier decision. Both roles ran the full width for a
+ * while, on the reasoning that one reading axis suits a narrow sidebar — but
+ * that made a one-line question read as just another paragraph, with only a
+ * 10px label to say it was the thing that started the exchange. Sized to its
+ * own text and set against the answer's alignment, it is findable at a glance
+ * when scrolling back. `max-width: 100%` keeps a long question from becoming
+ * a narrow column of wrapped text.
  */
-test("the transcript is a single left-aligned column", () => {
+test("the question is a bubble, the answer is a column", () => {
   const userRule = css.match(/^\.msg\.user \{[^}]*\}/m);
   assert.ok(userRule, ".msg.user should still be styled");
-  assert.doesNotMatch(
-    userRule[0],
-    /align-self:\s*flex-end/,
-    "user messages must not be pulled to the right"
-  );
-  assert.doesNotMatch(
-    userRule[0],
-    /max-width:\s*\d+%/,
-    "user messages should run the full column width"
-  );
+  assert.match(userRule[0], /align-self: flex-end/);
+  assert.match(userRule[0], /width: fit-content/);
+
+  // The answer keeps the full width: long prose in a narrow column wants it.
+  const agentRule = css.match(/^\.msg\.agent \{[^}]*\}/m);
+  assert.ok(agentRule);
+  assert.doesNotMatch(agentRule[0], /flex-end|fit-content/);
 });
 
 /**
- * Without the bubble and the right-hand alignment, the only thing separating
- * your words from Kiro's is the label above them. Losing it makes the
- * transcript unreadable, and nothing else would catch that.
+ * Kiro's turn has no bubble and no alignment of its own, so the label above it
+ * is the only thing naming the author. Losing it makes the transcript
+ * unreadable, and nothing else would catch that.
  */
-test("every message says who wrote it", () => {
+test("Kiro's messages say who wrote them", () => {
   assert.match(js, /msg-role/, "chat.js should label each message with its author");
   assert.match(css, /^\.msg-role \{/m, "the role label needs a style");
+  assert.match(js, /roleLabel\("Kiro"\)/);
 });
 
 /**

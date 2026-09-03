@@ -1,44 +1,27 @@
 import * as vscode from "vscode";
 import { ContentBlock } from "./kiroSession";
+import {
+  Attachment,
+  buildBlocks as buildPromptBlocks,
+  canReadSelectionFrom,
+  clipSelection,
+  SelectionContext,
+} from "./promptBlocks";
 
-/** Something the user attached to the next message. */
-export interface Attachment {
-  id: string;
-  kind: "file" | "folder" | "image";
-  /** Short label shown on the chip. */
-  label: string;
-  /** Full path, for files and folders. */
-  path?: string;
-  /** Base64 payload, for images. */
-  data?: string;
-  mimeType?: string;
-}
-
-/** Where the caret is right now, sent along automatically. */
-export interface SelectionContext {
-  relativePath: string;
-  /** Full path on disk, so the file itself can be attached. Empty for
-   *  untitled and other documents that are not on disk. */
-  fsPath: string;
-  languageId: string;
-  startLine: number;
-  endLine: number;
-  text: string;
-  hasSelection: boolean;
-}
-
-const MAX_SELECTION_CHARS = 12000;
+export { Attachment, SelectionContext };
 
 /** Read the active editor's selection, or the file if nothing is selected. */
 export function readSelection(): SelectionContext | undefined {
   const editor = vscode.window.activeTextEditor;
-  if (!editor || editor.document.uri.scheme === "output") {
+  // A diff, a git side, a search result or an output pane is a *view* of
+  // something, not a file the user is working on. Its path leads nowhere.
+  if (!editor || !canReadSelectionFrom(editor.document.uri.scheme)) {
     return undefined;
   }
 
   const selection = editor.selection;
   const hasSelection = !selection.isEmpty;
-  const text = hasSelection ? editor.document.getText(selection) : "";
+  const clipped = clipSelection(hasSelection ? editor.document.getText(selection) : "");
 
   return {
     relativePath: vscode.workspace.asRelativePath(editor.document.uri),
@@ -47,82 +30,22 @@ export function readSelection(): SelectionContext | undefined {
     languageId: editor.document.languageId,
     startLine: selection.start.line + 1,
     endLine: selection.end.line + 1,
-    text: text.length > MAX_SELECTION_CHARS ? text.slice(0, MAX_SELECTION_CHARS) : text,
+    text: clipped.text,
     hasSelection,
+    truncated: clipped.truncated,
   };
 }
 
-function fileUri(fsPath: string): string {
-  return vscode.Uri.file(fsPath).toString();
-}
-
-/**
- * Build the message Kiro receives.
- *
- * Files and folders go as resource_link blocks plus a plain-text list of paths.
- * Kiro reports embeddedContext as false, meaning it will not take file contents
- * inlined in the prompt, so it reads them itself through fs/read_text_file. The
- * text list is what makes the paths visible to the model either way.
- */
+/** Build the message Kiro receives. The shaping lives in `promptBlocks`. */
 export function buildBlocks(
   message: string,
   attachments: Attachment[],
   selection: SelectionContext | undefined,
   includeSelection: boolean
 ): ContentBlock[] {
-  const blocks: ContentBlock[] = [];
-  const notes: string[] = [message.trim()];
-
-  const files = attachments.filter((a) => a.kind === "file" && a.path);
-  const folders = attachments.filter((a) => a.kind === "folder" && a.path);
-  const images = attachments.filter((a) => a.kind === "image" && a.data);
-
-  if (files.length > 0) {
-    notes.push("", "Files to look at:");
-    for (const f of files) {
-      notes.push(`- ${f.path}`);
-    }
-  }
-  if (folders.length > 0) {
-    notes.push("", "Folders to look at:");
-    for (const f of folders) {
-      notes.push(`- ${f.path}`);
-    }
-  }
-
-  if (includeSelection && selection) {
-    if (selection.hasSelection) {
-      notes.push(
-        "",
-        `I am looking at ${selection.relativePath}, lines ${selection.startLine} to ${selection.endLine}:`,
-        "```" + selection.languageId,
-        selection.text,
-        "```"
-      );
-    } else {
-      notes.push("", `I am looking at ${selection.relativePath}.`);
-    }
-  }
-
-  blocks.push({ type: "text", text: notes.join("\n").trim() });
-
-  for (const f of [...files, ...folders]) {
-    blocks.push({
-      type: "resource_link",
-      uri: fileUri(f.path as string),
-      name: f.label,
-    });
-  }
-
-  for (const img of images) {
-    blocks.push({
-      type: "image",
-      data: img.data as string,
-      mimeType: img.mimeType ?? "image/png",
-    });
-  }
-
-  return blocks;
+  return buildPromptBlocks(message, attachments, selection, includeSelection, (fsPath) =>
+    vscode.Uri.file(fsPath).toString()
+  ) as ContentBlock[];
 }
 
 /** Let the user pick files from the workspace. */

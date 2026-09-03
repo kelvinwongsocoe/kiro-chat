@@ -174,7 +174,24 @@ export class AcpClient {
         this.options.onLog(`[kiro stdout] ${line}`);
         continue;
       }
-      this.dispatch(message);
+      /*
+       * One bad message must not cost us the rest of the chunk.
+       *
+       * Kiro often writes several notifications in a single stdio write, and
+       * this loop walks them in order. A throw anywhere in a handler used to
+       * abandon the whole loop, so every line after it in that write was
+       * dropped on the floor — silently, and looking exactly like Kiro never
+       * having sent them.
+       */
+      try {
+        this.dispatch(message);
+      } catch (err) {
+        this.options.onLog(
+          `Failed to handle ${message?.method ?? "a reply"}: ${
+            err instanceof Error ? err.message : String(err)
+          }`
+        );
+      }
     }
   }
 
