@@ -98,7 +98,7 @@ test("there is one definition of a write-like tool, not two", () => {
   assert.match(
     session,
     /if \(!isWriteLikeTool\(update\)\) return;/,
-    "observeDirectFileWrite should use the shared detector"
+    "observeToolPaths should use the shared detector"
   );
   assert.doesNotMatch(
     session,

@@ -4,7 +4,7 @@
  * Two places need the same answer, and they used to disagree because only one
  * of them had a definition:
  *
- * - `observeDirectFileWrite` snapshots the file so the edit can be reviewed.
+ * - `observeToolPaths` snapshots the file so the edit can be reviewed.
  * - `askPermission` skips the approval prompt for edits, because the review
  *   diff is about to ask the same question. Asking twice for one edit is the
  *   thing that made the flow feel wrong.

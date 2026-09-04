@@ -1,5 +1,35 @@
 # Changelog
 
+## 0.25.0
+
+- **An edit made by a tool the extension did not recognise no longer lands unreviewed.**
+  `isWriteLikeTool` gated the pre-turn *snapshot*, not just the simulated result — so a tool
+  shape it did not know, or a path it could not find, meant no baseline, no diff, no
+  keep-or-undo card, and Kiro's edit simply appeared on disk with nothing said about it. An
+  unreviewed edit is the one outcome nobody wants, and a heuristic was the only thing
+  standing in its way.
+
+  The heuristic is a hint now, the same demotion `DirectFileChange.expected` already went
+  through. Every path any tool mentions gets a snapshot, whatever the tool is — reading a
+  file is the strongest available signal that an edit is coming — and the end-of-turn pass
+  reviews whatever actually differs from its snapshot. "Did this change?" needs no
+  heuristic to answer correctly.
+
+- **Paths are read from everywhere Kiro puts them.** Only `rawInput.path` was consulted.
+  The payload captured from a real turn carries the path in `locations` *and* in
+  `rawInput.operations[].path`, and in neither of the places the extractor looked — so the
+  `operations` form, which the built-in edit tools use, was missed every time.
+
+- **A file the user edits mid-turn is deliberately still not swept into a review.** A
+  baseline exists for two reasons: a tool mentioned the file, or the user attached it. Only
+  the first means Kiro was working on it, and only those are reviewed. A diff offering to
+  undo the user's own typing would be worse than the gap it closed.
+
+- Snapshots no longer throw. A directory, an unreadable path or something implausibly large
+  comes back as "no baseline" rather than an exception — which, now that far more files are
+  snapshotted, would otherwise have taken the whole keep-or-undo card down with it. Files
+  over 10MB are skipped and logged.
+
 ## 0.24.0
 
 - **The `@kiro` chat participant is gone.** It was a second way into the same Kiro session,

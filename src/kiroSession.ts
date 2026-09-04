@@ -198,6 +198,16 @@ export function isSessionUpdate(method: string): boolean {
   return bare === "session/update" || bare === "session/notification";
 }
 
+/**
+ * How large a file to hold a pre-turn copy of.
+ *
+ * Baselines are taken for every file a tool mentions now, not only the ones
+ * being written, so a turn that reads widely holds far more than it used to.
+ * Source files are nowhere near this, and something that is would not make a
+ * readable diff anyway.
+ */
+const MAX_BASELINE_BYTES = 10 * 1024 * 1024;
+
 function normaliseKind(kind: unknown): string {
   return String(kind ?? "")
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
@@ -222,6 +232,14 @@ export class KiroSession {
   private readonly turnBaselines = new Map<string, FileSnapshot>();
   private readonly directFileChanges = new Map<string, DirectFileChange>();
   private readonly observedWriteTools = new Set<string>();
+  /**
+   * Every workspace path any tool mentioned this turn, write-like or not.
+   *
+   * This is what the end-of-turn review walks. A path only reaches it through
+   * a tool call, so a file the *user* edited while the turn ran is not swept
+   * into a diff offering to undo their own work.
+   */
+  private readonly toolTouchedPaths = new Set<string>();
   /** A write routed through the ACP fs callback must not be reviewed twice. */
   private readonly clientReviewedPaths = new Set<string>();
   /**
@@ -724,7 +742,7 @@ export class KiroSession {
       case "tool_call_chunk":
       case "tool_call":
       case "tool_call_update": {
-        this.observeDirectFileWrite(update);
+        this.observeToolPaths(update);
         const tool = describeTool(update);
         this.output.appendLine(
           `[tool] ${tool.status} ${tool.title}${tool.purpose ? ` — ${tool.purpose}` : ""}`
@@ -987,6 +1005,7 @@ export class KiroSession {
   private beginTurnFileCapture(blocks: ContentBlock[]): void {
     this.turnBaselines.clear();
     this.directFileChanges.clear();
+    this.toolTouchedPaths.clear();
     this.observedWriteTools.clear();
     this.clientReviewedPaths.clear();
     this.answeredPaths.clear();
@@ -1011,55 +1030,133 @@ export class KiroSession {
     return process.platform === "win32" ? normal.toLowerCase() : normal;
   }
 
-  private snapshotSync(full: string): FileSnapshot {
+  /**
+   * A pre-turn copy of one file, or undefined when there is nothing usable.
+   *
+   * Anything that is not simply a missing file — an unreadable path, a
+   * directory, something implausibly large — comes back undefined rather than
+   * throwing. A baseline that could not be taken is not the same as a file
+   * that does not exist, and recording it as the latter would put a wrong
+   * entry in the undo set. Throwing was worse still: baselines are now taken
+   * for every file a tool mentions, so one unreadable path would have taken
+   * `reportTurnChanges` down with it and lost the whole keep-or-undo card.
+   */
+  private snapshotSync(full: string): FileSnapshot | undefined {
     try {
+      const stat = fsSync.statSync(full);
+      if (!stat.isFile()) return undefined;
+      if (stat.size > MAX_BASELINE_BYTES) {
+        this.output.appendLine(
+          `Not snapshotting ${this.displayPath(full)}: ${stat.size} bytes is past the limit.`
+        );
+        return undefined;
+      }
       return { full, exists: true, content: fsSync.readFileSync(full, "utf8") };
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         return { full, exists: false, content: "" };
       }
-      throw err;
+      this.output.appendLine(
+        `Could not snapshot ${this.displayPath(full)}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      return undefined;
     }
   }
 
-  private captureBaseline(full: string): FileSnapshot {
+  private captureBaseline(full: string): FileSnapshot | undefined {
     const key = this.pathKey(full);
     const saved = this.turnBaselines.get(key);
     if (saved) return saved;
     const snapshot = this.snapshotSync(full);
-    this.turnBaselines.set(key, snapshot);
+    if (snapshot) this.turnBaselines.set(key, snapshot);
     return snapshot;
   }
 
-  /** Record the path and expected content from a built-in edit tool update. */
-  private observeDirectFileWrite(update: any): void {
+  /**
+   * Every workspace path a tool update mentions, however it names them.
+   *
+   * Kiro puts a path in more places than one, and reading only `rawInput.path`
+   * missed most of them. The payload captured in `test/toolSteps.test.js` for
+   * a single read carries the path twice — once in `locations`, once in
+   * `rawInput.operations[].path` — and in neither of the places this used to
+   * look. A path that is never found is a file that is never snapshotted, and
+   * therefore never reviewed.
+   */
+  private pathsMentionedBy(update: any): string[] {
+    const raw = update?.rawInput ?? update?.input ?? update?.toolCall?.rawInput;
+    const locations = (value: any) =>
+      Array.isArray(value) ? value.map((entry: any) => entry?.path) : [];
+
+    const candidates: unknown[] = [
+      raw?.path,
+      raw?.filePath,
+      raw?.file_path,
+      ...locations(update?.locations),
+      ...locations(update?.toolCall?.locations),
+      ...locations(raw?.operations),
+    ];
+
+    const out: string[] = [];
+    for (const value of candidates) {
+      if (typeof value !== "string" || !value) continue;
+      try {
+        const full = this.resolveInsideWorkspace(value);
+        if (!out.includes(full)) out.push(full);
+      } catch {
+        // Outside the open folders, so never writable through this extension
+        // and not part of the turn's change set.
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Watch a tool update for the files it is about.
+   *
+   * Two jobs, and they used to be one:
+   *
+   * - **Every** path any tool mentions gets a pre-turn snapshot, whatever the
+   *   tool is. Reading a file is the strongest available hint that an edit is
+   *   coming, and a snapshot is worth nothing unless it was taken first.
+   * - A tool that *looks* like a write additionally gets its result simulated,
+   *   so `finishDirectFileReviews` has something to compare against.
+   *
+   * `isWriteLikeTool` used to gate both, which made it the only thing standing
+   * between an edit and going unreviewed: a tool shape it did not recognise —
+   * or a path it could not find, which for the `operations` form was every
+   * time — meant no snapshot, no diff, and no keep-or-undo card. The edit
+   * simply appeared on disk. It is a hint now, the same demotion
+   * `DirectFileChange.expected` already went through, and for the same reason:
+   * an unreviewed edit is the one outcome nobody wants.
+   */
+  private observeToolPaths(update: any): void {
+    for (const full of this.pathsMentionedBy(update)) {
+      if (this.captureBaseline(full)) this.toolTouchedPaths.add(this.pathKey(full));
+    }
+
     // Shared with askPermission, which uses the same answer to decide that an
     // edit does not need a prompt of its own. Two copies of this heuristic
     // would eventually disagree, and the symptom would be a stray prompt.
     if (!isWriteLikeTool(update)) return;
 
     const raw = update?.rawInput ?? update?.input ?? update?.toolCall?.rawInput;
-
     const target = raw?.path ?? raw?.filePath ?? raw?.file_path;
-    if (typeof target !== "string" || !target) return;
-
-    let full: string;
-    try {
-      full = this.resolveInsideWorkspace(target);
-    } catch (err) {
-      this.output.appendLine(
-        `Ignored a write tool outside the workspace: ${
-          err instanceof Error ? err.message : String(err)
-        }`
-      );
-      return;
-    }
+    // The named target when there is one, otherwise whatever the update
+    // mentioned first — a write that only reports `locations` still has a file.
+    const full =
+      typeof target === "string" && target
+        ? this.pathsMentionedBy({ rawInput: { path: target } })[0]
+        : this.pathsMentionedBy(update)[0];
+    if (!full) return;
 
     const toolId = String(update?.toolCallId ?? update?.id ?? "");
     if (toolId && this.observedWriteTools.has(toolId)) return;
 
     const key = this.pathKey(full);
     const before = this.captureBaseline(full);
+    if (!before) return;
     const tracked = this.directFileChanges.get(key) ?? { before };
     const base = tracked.expected ?? before.content;
     const expected = this.expectedToolResult(base, raw);
@@ -1092,9 +1189,32 @@ export class KiroSession {
    * versions through the same selectable reviewer as an ACP callback write.
    */
   private async finishDirectFileReviews(): Promise<void> {
-    if (this.directFileChanges.size === 0) return;
-    const changes = [...this.directFileChanges.entries()];
+    /*
+     * Everything a tool touched, not only what looked like a write.
+     *
+     * This used to walk `directFileChanges` alone, so the review a file got
+     * depended entirely on `isWriteLikeTool` having recognised the tool that
+     * wrote it. Walking every snapshotted path a tool mentioned and comparing
+     * it against disk asks a better question — "did this actually change?" —
+     * which needs no heuristic to be right. `directFileChanges` now only
+     * supplies the simulated result, and that was always just a hint.
+     *
+     * Baselines from attached files are deliberately not included: they were
+     * snapshotted because the user attached them, not because Kiro touched
+     * them, and a file the *user* edited mid-turn must not be handed back as a
+     * diff offering to undo their own work.
+     */
+    const candidates = new Map<string, DirectFileChange>();
+    for (const key of this.toolTouchedPaths) {
+      const before = this.turnBaselines.get(key);
+      if (before) candidates.set(key, { before });
+    }
+    for (const [key, tracked] of this.directFileChanges) candidates.set(key, tracked);
+
     this.directFileChanges.clear();
+    this.toolTouchedPaths.clear();
+    if (candidates.size === 0) return;
+    const changes = [...candidates.entries()];
 
     const config = vscode.workspace.getConfiguration("kiroChat");
     const writesEnabled = config.get<boolean>("allowFileWrites", true);

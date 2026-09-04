@@ -103,7 +103,7 @@ test("closing or cancelling a review rejects pending writes", () => {
 
 test("Kiro built-in FileWrite tools are staged even when they bypass the ACP callback", () => {
   assert.match(session, /beginTurnFileCapture\(usable\)/);
-  assert.match(session, /observeDirectFileWrite\(update\)/);
+  assert.match(session, /observeToolPaths\(update\)/);
   assert.match(session, /finishDirectFileReviews\(\)/);
   assert.match(session, /restoreSnapshot\(tracked\.before\)/);
   assert.match(session, /expectedToolResult/);

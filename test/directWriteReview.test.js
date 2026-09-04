@@ -320,7 +320,7 @@ async function exercise(action, readOnly = false) {
     session.beginTurnFileCapture([
       { type: "resource_link", uri: pathToFileURL(file).href, name: "example.js" },
     ]);
-    session.observeDirectFileWrite({
+    session.observeToolPaths({
       sessionUpdate: "tool_call",
       toolCallId: "write-1",
       title: "Editing example.js",
@@ -364,7 +364,7 @@ async function exerciseWritePath(action, errors = [], formatOnSave = false) {
     session.beginTurnFileCapture([
       { type: "resource_link", uri: pathToFileURL(file).href, name: "example.js" },
     ]);
-    session.observeDirectFileWrite({
+    session.observeToolPaths({
       sessionUpdate: "tool_call",
       toolCallId: "write-1",
       title: "Editing example.js",
@@ -412,7 +412,7 @@ async function exerciseReporting(action, reported) {
     session.beginTurnFileCapture([
       { type: "resource_link", uri: pathToFileURL(file).href, name: "example.js" },
     ]);
-    session.observeDirectFileWrite({
+    session.observeToolPaths({
       sessionUpdate: "tool_call",
       toolCallId: "write-1",
       title: "Editing example.js",
@@ -729,4 +729,138 @@ test("a formatter between two hunk decisions does not abort the review", async (
   const errors = [];
   await exerciseWritePath("acceptFirstRejectRest", errors, true);
   assert.deepEqual(errors, [], "the second decision must still be applicable");
+});
+
+// ---------------------------------------------------------------------------
+// The gap the write heuristic used to leave open.
+//
+// `isWriteLikeTool` gated the *snapshot*, not only the simulation — so a tool
+// shape it did not recognise, or a path it could not find, meant no baseline,
+// no review, no keep-or-undo card, and Kiro's edit simply appeared on disk.
+// Both shapes below are real: the payload captured in test/toolSteps.test.js
+// carries its path in `locations` and in `rawInput.operations[].path`, and in
+// neither of the two places the old extractor looked.
+// ---------------------------------------------------------------------------
+
+/**
+ * Drive one turn with an arbitrary tool update and a direct write behind it.
+ * `attach` decides whether the file is also a prompt attachment, which is the
+ * other way a baseline can be taken.
+ */
+async function exerciseTool({ update, action = "reject", attach = false, write = true }) {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), "kiro-gap-"));
+  const file = path.join(folder, "example.js");
+  const before = "const value = 'old';\n";
+  const after = "const value = 'new';\n";
+  fs.writeFileSync(file, before);
+
+  try {
+    const vscode = fakeVscode(folder, action);
+    const KiroSession = loadSession(vscode);
+    const session = new KiroSession({ appendLine() {} }, events());
+
+    session.beginTurnFileCapture(
+      attach
+        ? [{ type: "resource_link", uri: pathToFileURL(file).href, name: "example.js" }]
+        : []
+    );
+    if (update) session.observeToolPaths(update(file));
+
+    // Kiro CLI performing the write itself, inside its own tool.
+    if (write) fs.writeFileSync(file, after);
+    await session.finishDirectFileReviews();
+    return { content: fs.readFileSync(file, "utf8"), before, after };
+  } finally {
+    if (fs.existsSync(file)) fs.unlinkSync(file);
+    fs.rmdirSync(folder);
+  }
+}
+
+/** Not an edit by any measure the heuristic has: unknown kind, no command. */
+const unrecognisedWrite = (file) => ({
+  sessionUpdate: "tool_call",
+  toolCallId: "mystery-1",
+  title: "Applying a patch to example.js",
+  kind: "custom_patch",
+  locations: [{ path: file }],
+});
+
+test("a write tool nobody recognises is still reviewed", async () => {
+  const result = await exerciseTool({ update: unrecognisedWrite, action: "reject" });
+
+  assert.equal(
+    result.content,
+    result.before,
+    "an unrecognised write must still open a review, and rejecting it must restore the file"
+  );
+});
+
+test("an unrecognised write that is accepted is kept", async () => {
+  const result = await exerciseTool({ update: unrecognisedWrite, action: "applyAll" });
+  assert.equal(result.content, result.after, "accepting it must keep Kiro's edit");
+});
+
+/** The operations[] form, which the old path extractor never looked at. */
+test("a write whose path is only in rawInput.operations is found", async () => {
+  const result = await exerciseTool({
+    update: (file) => ({
+      sessionUpdate: "tool_call",
+      toolCallId: "ops-1",
+      title: "Editing example.js",
+      kind: "edit",
+      rawInput: { command: "strReplace", operations: [{ mode: "Line", path: file }] },
+    }),
+    action: "reject",
+  });
+
+  assert.equal(result.content, result.before, "the path in operations[] has to be found");
+});
+
+/** A read is the strongest hint an edit is coming, so it earns a snapshot. */
+test("a file only ever read is still snapshotted, and reviewed if it changes", async () => {
+  const result = await exerciseTool({
+    update: (file) => ({
+      sessionUpdate: "tool_call",
+      toolCallId: "read-1",
+      title: "Reading example.js:1",
+      kind: "read",
+      locations: [{ path: file }],
+    }),
+    action: "reject",
+  });
+
+  assert.equal(result.content, result.before);
+});
+
+/**
+ * The deliberate exclusion. A file gets a baseline for one of two reasons: a
+ * tool mentioned it, or the user attached it. Only the first means Kiro was
+ * working on it. Reviewing the second would hand the user a diff offering to
+ * undo an edit they made themselves while the turn was running.
+ */
+test("a file the user edited, that no tool touched, is not reviewed", async () => {
+  const result = await exerciseTool({ update: undefined, attach: true, action: "reject" });
+
+  assert.equal(
+    result.content,
+    result.after,
+    "an attachment nothing touched must be left alone, not restored over"
+  );
+});
+
+/** Nothing changed means nothing to answer for; no diff should open. */
+test("a turn that changes nothing opens no review", async () => {
+  const result = await exerciseTool({
+    update: (file) => ({
+      sessionUpdate: "tool_call",
+      toolCallId: "read-2",
+      title: "Reading example.js:1",
+      kind: "read",
+      locations: [{ path: file }],
+    }),
+    write: false,
+    action: "reject",
+  });
+
+  assert.equal(result.content, result.before, "an untouched file stays exactly as it was");
 });

@@ -215,6 +215,21 @@ passes Kiro's option ids and labels through `SessionEvents.onPermission`; the pr
 posts an inline permission card and resolves the request when `chat.js` returns a
 `permissionDecision`. The VS Code notification is only a fallback when no panel exists.
 
+**Neither is `isWriteLikeTool`, and for the same reason.** It used to gate the pre-turn
+snapshot in `observeToolPaths` (called `observeDirectFileWrite` until 0.25.0, when it
+stopped being only about writes). A tool shape it did not recognise meant no baseline, so
+no review and no keep-or-undo card — the edit just appeared on disk. Every path any tool
+mentions is snapshotted now, and `finishDirectFileReviews` walks `toolTouchedPaths` and
+reviews whatever differs from its baseline; the heuristic only decides whether to
+*simulate* a result. `pathsMentionedBy` reads `locations`, `rawInput.path` and
+`rawInput.operations[].path`, because Kiro uses all three and only the middle one was
+being read.
+
+Baselines taken from prompt attachments are deliberately **not** in `toolTouchedPaths`. A
+file gets a snapshot either because a tool touched it or because the user attached it, and
+only the first means Kiro was working on it — reviewing the second would offer to undo the
+user's own mid-turn edit.
+
 **`DirectFileChange.expected` is a hint, never a gate.** It simulates what a tool input
 should produce, chained across every edit to a file in the turn. It used to have to match
 the file byte for byte or the review was abandoned — which drifted for ordinary reasons

@@ -10,7 +10,7 @@
  *
  * Free of any `vscode` import so it can be exercised on its own — see
  * `test/workspaceBoundary.test.js` — and synchronous, because
- * `observeDirectFileWrite` runs inside a notification handler and cannot await.
+ * `observeToolPaths` runs inside a notification handler and cannot await.
  */
 
 import * as path from "node:path";
