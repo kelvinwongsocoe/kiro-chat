@@ -20,18 +20,25 @@ export interface ActiveFile {
 export interface FileAttachment {
   id: string;
   kind: "file";
+  /** Always "active" here: this is the one nobody asked for. */
+  source: "active";
   label: string;
   path: string;
 }
 
 /**
- * Marked out with its own id prefix so the panel can tell the automatic one
- * from a file the user attached by hand.
+ * Marked out twice over — its own id prefix, and `source` — so the panel can
+ * tell the automatic one from a file the user attached by hand.
+ *
+ * The id prefix is for the chip row; `source` is what `buildBlocks` reads, so
+ * the file the editor happens to be showing is not listed to Kiro as though
+ * the user had picked it.
  */
 export function activeFileAttachment(active: ActiveFile): FileAttachment {
   return {
     id: `active:${active.path}`,
     kind: "file",
+    source: "active",
     label: active.label,
     path: active.path,
   };

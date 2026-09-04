@@ -169,3 +169,76 @@ test("with nothing highlighted, Kiro is told the file and not given a block", ()
   assert.match(body, /I am looking at media\/chat\.js\./);
   assert.doesNotMatch(body, /```/, "there is no code to fence");
 });
+
+// ---- one mention per file --------------------------------------------
+
+const openFile = {
+  id: "active:C:\\kiro-chat\\media\\chat.js",
+  kind: "file",
+  source: "active",
+  label: "media/chat.js",
+  path: "C:\\kiro-chat\\media\\chat.js",
+};
+const other = { id: "6", kind: "file", label: "src/usage.ts", path: "C:\\w\\src\\usage.ts" };
+
+/*
+ * The file being looked at was listed by its absolute path under "Files to
+ * look at" and then again, relatively, by the selection block —
+ * `C:\kiro-chat\media\chat.js` and `media/chat.js`, two spellings that do not
+ * look like one file. Kiro was being handed one file as two.
+ */
+test("the file the selection is in is named once, not twice", () => {
+  const body = textOf(build("why slow?", [openFile], selectionOf()));
+  assert.match(body, /I am looking at media\/chat\.js, lines 26 to 26:/);
+  assert.doesNotMatch(body, /Files to look at:/, "the selection block already names it");
+  assert.doesNotMatch(body, /kiro-chat\\media\\chat\.js/, "and names it only the once");
+});
+
+/** Losing the path from the text must not lose the link Kiro opens it by. */
+test("the link survives even when the text mention does not", () => {
+  const blocks = build("why slow?", [openFile], selectionOf());
+  const links = blocks.filter((b) => b.type === "resource_link");
+  assert.deepEqual(links.map((b) => b.name), ["media/chat.js"]);
+});
+
+test("a file attached by hand is deduplicated the same way", () => {
+  const byHand = { id: "7", kind: "file", label: "media/chat.js", path: openFile.path };
+  const body = textOf(build("why slow?", [byHand], selectionOf()));
+  assert.doesNotMatch(body, /Files to look at:/, "same file, same rule");
+});
+
+test("the other files you attached are untouched by it", () => {
+  const body = textOf(build("why slow?", [other, openFile], selectionOf()));
+  assert.match(body, /Files to look at:\n- C:\\w\\src\\usage\.ts/);
+  assert.match(body, /I am looking at media\/chat\.js/);
+});
+
+/*
+ * Listed among the files the user picked, the file that merely happens to be
+ * focused read as one of them — so "update these files" quietly took in
+ * whatever tab was open. It only needs saying when the selection block is not
+ * already saying it, which means with `kiroChat.sendSelection` off.
+ */
+test("the file that is merely open is not listed as one you chose", () => {
+  const body = textOf(build("update these", [other, openFile], selectionOf(), false));
+  assert.match(body, /Files to look at:\n- C:\\w\\src\\usage\.ts/);
+  // Not as a bullet under that heading: it is named below, as what it is.
+  assert.doesNotMatch(
+    body,
+    /^- C:\\kiro-chat\\media\\chat\.js$/m,
+    "the open file is not one of the files to look at"
+  );
+  assert.match(body, /The file I have open is C:\\kiro-chat\\media\\chat\.js\./);
+});
+
+test("with the selection on, the open file needs no line of its own", () => {
+  const body = textOf(build("update these", [other, openFile], selectionOf()));
+  assert.doesNotMatch(body, /The file I have open is/, "the selection block says it");
+});
+
+test("a spelling difference does not defeat the deduplication", () => {
+  const body = textOf(
+    build("why slow?", [{ ...openFile, path: "c:/KIRO-CHAT/media/chat.js" }], selectionOf())
+  );
+  assert.doesNotMatch(body, /Files to look at:/);
+});

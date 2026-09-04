@@ -357,11 +357,51 @@ a global cap let a busy project evict a quiet one's history.
 
 `setupWatcher.ts` additionally takes its timers through an injected `Scheduler`, so `test/setupWatcher.test.js` drives the whole state machine without waiting out a real interval. Follow that pattern for anything else that polls.
 
-**The file/selection duplication has to be fixed in two places.** `renderChips` (the row
-above the box) and `addUserBubble` (the tags under a sent message) each build that list
-independently, so fixing one leaves the other showing `media/chat.js` beside
-`media/chat.js:23-27`. Both drop the file when the selection covers it, and both name
-files with `fileName()`, keeping the path in the tooltip.
+**The file/selection duplication has to be fixed in three places, and they are not
+independent.** `buildBlocks` (what Kiro receives), `renderChips` (the row above the box)
+and `addUserBubble` (the tags under a sent message) each build that list separately, so
+fixing one leaves another showing `media/chat.js` beside `media/chat.js:23-27`. The rule
+is *one mention per file, narrowest wins*: a file the selection block already names is
+not also listed above it. The two webview lists name files with `fileName()`, keeping the
+path in the tooltip.
+
+Two asymmetries in that rule are deliberate:
+
+- **Only the automatic file may be stood in for on screen.** `renderChips` suppresses the
+  `◎` chip, never an attachment chip: a chip is a control, and removing one because of a
+  transient highlight takes away the × that removes the file. `addUserBubble` reads
+  `source === "active"` for the same reason — a file attached by hand is still sent as its
+  own `resource_link`, so hiding its tag would leave no record in the transcript that it
+  went.
+- **`buildBlocks` drops the *text* mention, never the link.** The resource_link is how Kiro
+  opens the file; the list entry only makes the path visible. The entry is what duplicated,
+  so the entry is what goes.
+
+**Three sources feed one message, and `source` is what tells them apart.**
+`attachmentsForMessage` appends the focused file to whatever was attached by hand, dropping
+it when the same file is already there (`samePath`, so Windows spellings match). The
+automatic one carries `source: "active"`, which is what stops `buildBlocks` listing the
+tab that merely happens to be focused under "Files to look at" beside files the user chose
+— "update these files" quietly took in the focused one. With `kiroChat.sendSelection` off
+it gets its own line instead, saying what it is.
+
+**Attachments outlive the message; images do not.** The row used to be emptied after every
+send, so "add another file to the context" held for exactly one message — and because the
+`◎` chip comes back on its own, the row still looked populated while the rest had silently
+gone. Files and folders now stay until removed. An image is consumed, because its base64
+rides in the prompt itself and a sticky one re-sends megabytes per turn for a picture Kiro
+has already seen. What survives is marked `carried`, which is what stops Enter on an empty
+composer starting a whole turn out of chips that already went; attaching something new
+clears the mark, because "look at these" with no words is a real message — once.
+
+**A chip may only stand in for something that is actually going.** `sendingSelection` (are
+the highlighted lines going?) and `selectionCoversActiveFile` (may the selection chip stand
+in for the file chip?) are two questions, and collapsing them into one shipped a lie:
+dismiss the `◎` chip with its ×, then highlight something in that same file, and the file
+chip vanished behind a selection chip whose tooltip promised Kiro was getting the file
+while no `resource_link` went out — with the × that would have said otherwise now off
+screen. The second condition therefore ANDs in `includeActiveFile`, and the selection
+chip's tooltip branches on it too.
 
 **The selection chip reports state; it is not a control.** It carried an × that stopped
 the highlighted code being sent, which left the editor showing a selection the panel had
@@ -396,7 +436,17 @@ fixed a way Kiro was told something untrue, and all three are load-bearing:
 - `.dropzone`, `.chips`, `.usage-bar`, `.popup`, `.usage-panel` each get exactly one rule block.
 - `.usage-bar` is a `<button>` (it toggles the account panel) and must keep opting out of the global `button` styling, or the whole strip paints in the primary colour.
 - **`.composer-row` sets `--control-h` and every control in it takes that height.** They used to be sized three different ways and none of them lined up. Anything added to that row takes `--control-h` too. `.icon` also joined the `[hidden]` list above when Stop became an icon button: it is toggled with the `hidden` attribute and carries `display: inline-flex`, so it must stay below the `[hidden]` override.
-- **A plain-looking button must cancel `button:hover`, not just `button`.** `background: none` on a class beats `button`, but `button:hover` is a type plus a pseudo-class — specificity (0,1,1) — and outranks any single class, so the element sits transparent at rest and then paints solid primary blue under the pointer. This shipped three times (`.usage-bar`, `button.change-summary`, `.history-open`, which covered the row's own hover tint with a blue slab). The test walks every rule declaring both `background: none` and `border: none` and requires a matching `:hover`.
+- **A plain-looking button must cancel `button:hover`, not just `button`.** `background: none` on a class beats `button`, but `button:hover` is a type plus a pseudo-class — specificity (0,1,1) — and outranks any single class, so the element sits transparent at rest and then paints solid primary blue under the pointer. This shipped four times (`.usage-bar`, `button.change-summary`, `.history-open`, which covered the row's own hover tint with a blue slab, and `.chip-muted`). One test walks every rule declaring both `background: none` and `border: none` and requires a matching `:hover`.
+
+**That test catches only the spelling, which is how the fourth one got in.** `.chip-muted`
+says `background: transparent` and keeps a dashed border, so it matched neither half of
+that pair. The question is not how "no background of my own" is spelled — it is whether an
+element that VS Code will paint on hover has said otherwise. The second test therefore
+reads the `className` off every `document.createElement("button")` in `chat.js` and
+requires that, if any of its classes restyles the background, one of them carries a
+`:hover`. Per element, not per class: `.chip chip-muted` is covered by `.chip-muted:hover`.
+A hover rule need not be bare `.name:hover` either — `.permission-option:hover:not(:disabled)`
+counts, and a descendant rule deliberately does not.
 - Menus are anchored inside positioned parents (`.attach-wrap`, `.composer`) so they can't spill out of a narrow sidebar.
 
 **CSP is nonce-based** (`script-src 'nonce-...'`), so there are no inline handlers in the HTML — everything is wired up in `chat.js`. Text from Kiro goes through `escapeHtml` before the small hand-rolled markdown renderer runs, so a reply cannot inject markup.
@@ -412,6 +462,37 @@ newline, and a streaming reply is unterminated for as long as it is arriving. Li
 endings are normalised to `\n` before any of this runs, because the pattern consumed `\n`
 after the language but not `\r\n`, leaving a carriage return that `<pre>` painted as a
 blank line above and below every snippet.
+
+**`renderMarkdown` handles GFM pipe tables, and the guard is the load-bearing half.**
+Without table support every row fell through to the paragraph branch, so a table arrived
+as one `<p>` per row with margins between and `|---|---|` printed as literal dashes —
+which is most of any "here is the mapping" reply, and agents write those constantly. What
+identifies a table is the **delimiter row**, exactly as GFM says, and its cell count must
+match the header's: a line containing a pipe above a line of dashes is otherwise ordinary
+prose over a horizontal rule, and turning that into a table is a worse bug than the one
+being fixed. Rows shorter than the header are padded rather than dropped, because a
+missing cell shifts every column after it. The table is wrapped in `.table-wrap`, which
+scrolls on its own — a sidebar is three inches wide, and the alternative is a horizontal
+scrollbar on the whole conversation.
+
+**Text that resumes after a tool step starts a new paragraph.** Kiro says something, calls
+a tool, then says something else, and all of it is appended to one `buffer` — so the two
+ran together with no space at all: "…rather than guessing from names.I notice
+RENEWAL_WINDOW_CLOSED…". Nothing in the stream marks where one message ends, but a step
+starting is a boundary that can be seen, so `breakBeforeText` is set there and consumed by
+the next chunk. It is set only where a tool row is **created**, never on a status update
+for a step already listed: those arrive while text is still streaming and would split a
+sentence down the middle, which is the same bug pointing the other way.
+
+**`test/webview.test.js` can run the renderer, and should.** `loadRenderer()` slices
+`escapeHtml` through `renderMarkdown` — contiguous and self-contained — and evaluates it,
+so the table and fence tests assert on rendered HTML rather than on the shape of the
+source. Prefer that to a regex whenever the thing under test is a behaviour.
+
+**Do not slice a fixed number of characters out of a function to assert on it.** Four
+tests did (`slice(0, 2600)`, `slice(0, 400)` twice, `slice(0, 500)`) and every one of them
+failed for a comment being added above the line they wanted — a test that breaks when
+nothing broke. Slice to the next `case`, the next `function`, or the end of the block.
 
 **The code-block copy button is delegated, and it must stay that way.** A streaming reply
 runs `body.innerHTML = renderMarkdown(buffer)` on every frame, so a listener bound to the

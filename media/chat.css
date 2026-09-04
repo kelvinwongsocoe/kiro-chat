@@ -216,6 +216,81 @@ body {
 }
 
 /*
+ * Tables.
+ *
+ * A table is the one thing in a reply with a width of its own, and this panel
+ * is often a sidebar three inches across. It scrolls inside its own wrapper
+ * rather than widening the transcript: the alternative is either a horizontal
+ * scrollbar on the whole conversation or columns crushed to one character.
+ */
+.table-wrap {
+  /* The rounded edge needs something to clip against, and `auto` is also the
+     safety net for a table too wide to wrap. */
+  overflow-x: auto;
+  margin: 0 0 0.8em;
+  border: 1px solid var(--vscode-panel-border);
+  border-radius: 6px;
+}
+
+.table-wrap table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95em;
+  line-height: 1.45;
+}
+
+.table-wrap th,
+.table-wrap td {
+  padding: 6px 10px;
+  text-align: left;
+  vertical-align: top;
+  /*
+   * Words are never broken. A column is as wide as its longest word needs,
+   * sentences wrap inside that, and the wrapper scrolls only when the whole
+   * thing genuinely does not fit.
+   *
+   * Two things were tried and both were worse. `overflow-wrap: anywhere`
+   * broke words at any character, so the first column — in a mapping table
+   * always an identifier — came out as "SOURCE_NOT_REN / EWABLE" and
+   * "RENEWAL_WINDO / W_CLOSE / D". Replacing that with a flat
+   * `min-width: 8em` per cell stopped the shredding but priced every table
+   * the same: "| a | b | c |" is three characters of content and it scrolled
+   * too, in a panel with room to spare.
+   *
+   * Letting the content ask for its own width does both: a table of short
+   * values stays small and quiet, and a table of long identifiers scrolls
+   * rather than being crushed. Which is the browser's default behaviour —
+   * the job here is to not override it.
+   */
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+/*
+ * A rule under the header and hairlines between rows — not a full grid.
+ *
+ * Bordering every cell reads as a spreadsheet pasted into a conversation:
+ * it draws the container rather than the content, and at chat width the
+ * vertical lines are pure noise. This is the shape the rest of the panel
+ * already uses for quiet structure.
+ */
+.table-wrap th {
+  font-weight: 600;
+  background: var(--vscode-editorWidget-background, transparent);
+  border-bottom: 1px solid var(--vscode-panel-border);
+}
+
+.table-wrap tbody tr + tr td {
+  border-top: 1px solid var(--vscode-panel-border);
+}
+
+/* A cell is a cell, not a paragraph: its own margins would double the gap. */
+.table-wrap td > p:first-child,
+.table-wrap th > p:first-child {
+  margin: 0;
+}
+
+/*
  * The editor's own background, not the panel's.
  *
  * `textCodeBlock-background` is a faint wash designed to sit inside prose,
@@ -1002,6 +1077,25 @@ button:disabled {
   background: transparent;
   color: var(--vscode-descriptionForeground);
   cursor: pointer;
+}
+
+/*
+ * A <button> that sets a background of its own still loses to `button:hover`
+ * — a type plus a pseudo-class, specificity (0,1,1), which outranks any single
+ * class — so this sat transparent at rest and then painted solid primary blue
+ * the moment the pointer crossed it. The same trap as .usage-bar, the review
+ * summary line and the past-chats rows; `transparent` hides from the test that
+ * catches `none`, which is why this one lasted.
+ */
+.chip-muted:hover {
+  border-color: var(--vscode-focusBorder);
+  background: var(--vscode-list-hoverBackground);
+  color: var(--vscode-foreground);
+}
+
+/* Pushed to the end of the row, because it acts on everything before it. */
+.chips-clear {
+  margin-left: auto;
 }
 
 .chip-open {

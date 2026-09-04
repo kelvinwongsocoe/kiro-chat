@@ -27,6 +27,13 @@
 
   let current = null;
   let buffer = "";
+  /**
+   * Set when a tool step appears, so the text that resumes after it starts a
+   * paragraph instead of running on from the sentence before. It needs no
+   * resetting between turns: the check also requires a non-empty buffer, and
+   * a new turn starts with an empty one.
+   */
+  let breakBeforeText = false;
   let models = [];
   let currentModelId = "";
   const CHAT_MODES = [
@@ -289,7 +296,73 @@
       }
     };
 
-    for (const line of lines) {
+    /*
+     * GFM pipe tables.
+     *
+     * Every row used to fall through to the paragraph branch, so a table
+     * arrived as one line per row with a blank gap between each and the
+     * `|---|---|` delimiter rendered as literal dashes — a wall of pipes
+     * where a table should be. Agents answer with tables constantly (any
+     * "here is the mapping" reply is one), so this was most of a long answer
+     * arriving unreadable.
+     *
+     * The delimiter row is what identifies a table, exactly as GFM says, and
+     * its cell count has to match the header's. A line with a pipe in it
+     * followed by a line of dashes is otherwise ordinary prose above a setext
+     * underline, and turning that into a table would be a worse bug than the
+     * one being fixed.
+     */
+    const DELIMITER = /^\s*\|?(?:\s*:?-+:?\s*\|)*\s*:?-+:?\s*\|?\s*$/;
+
+    const cellsOf = (row) => {
+      let text = row.trim();
+      // The outer pipes are optional in GFM, and they are not cells.
+      if (text.startsWith("|")) text = text.slice(1);
+      if (/(^|[^\\])\|$/.test(text)) text = text.slice(0, -1);
+      return text.split(/(?<!\\)\|/).map((c) => c.trim().replace(/\\\|/g, "|"));
+    };
+
+    const alignOf = (spec) => {
+      const cell = spec.trim();
+      if (/^:-+:$/.test(cell)) return "center";
+      if (/^-+:$/.test(cell)) return "right";
+      return "";
+    };
+
+    for (let i = 0; i < lines.length; i += 1) {
+      const line = lines[i];
+      const next = lines[i + 1] ?? "";
+      if (line.includes("|") && next.includes("-") && DELIMITER.test(next)) {
+        const heads = cellsOf(line);
+        const aligns = cellsOf(next).map(alignOf);
+        if (aligns.length === heads.length) {
+          closeList();
+          i += 2;
+          const rows = [];
+          while (i < lines.length && lines[i].trim() && lines[i].includes("|")) {
+            rows.push(cellsOf(lines[i]));
+            i += 1;
+          }
+          // Step back onto the last row; the loop's own increment moves on.
+          i -= 1;
+
+          const cell = (text, align, tag) =>
+            `<${tag}${align ? ` style="text-align:${align}"` : ""}>${inline(text)}</${tag}>`;
+          const out = ['<div class="table-wrap"><table><thead><tr>'];
+          heads.forEach((head, n) => out.push(cell(head, aligns[n], "th")));
+          out.push("</tr></thead><tbody>");
+          for (const row of rows) {
+            out.push("<tr>");
+            // A short row is padded, not dropped. A ragged table still reads;
+            // a missing cell shifts every column after it out of line.
+            heads.forEach((_, n) => out.push(cell(row[n] ?? "", aligns[n], "td")));
+            out.push("</tr>");
+          }
+          out.push("</tbody></table></div>");
+          html.push(out.join(""));
+          continue;
+        }
+      }
       const codeMatch = line.match(/^\u0000CODE(\d+)\u0000$/);
       if (codeMatch) {
         closeList();
@@ -482,7 +555,11 @@
     const tags = [];
     for (const a of message.attachments || []) {
       if (a.preview) continue;
-      if (selected && samePathish(a.label, selected)) continue;
+      // Only the automatic one steps aside. A file attached by hand is a
+      // separate thing the user did, and it is still sent as its own link, so
+      // hiding it under a range they happened to have highlighted would leave
+      // no record in the transcript that it went at all.
+      if (selected && a.source === "active" && samePathish(a.label, selected)) continue;
       tags.push({ text: `${iconFor(a.kind)} ${fileName(a.label)}`, title: a.label });
     }
     if (message.selection) {
@@ -1176,15 +1253,27 @@
     const activeAlreadyAttached =
       activeFile && attachments.some((a) => samePathish(a.path, activeFile.path));
 
+    // Whether the highlighted lines are really going with this message.
+    const sendingSelection = Boolean(
+      selection && selection.hasSelection && includeSelection
+    );
+
     /*
      * A selection always comes from the file you are looking at, so while one
      * is being sent the two chips named the same file twice — "chat.js" beside
      * "chat.js:26-26". The narrower one says everything the broader one did,
      * so it stands for both. Switch the selection off and the file chip comes
      * back, because then it is the only thing still going.
+     *
+     * It can only stand in for a file that is actually going, though, and
+     * that is why this is not just `sendingSelection`. Dismiss the file chip
+     * with its × and then highlight something in that same file: the file chip
+     * vanished behind a selection chip whose tooltip promised Kiro was getting
+     * the file, the × that would have said otherwise was off screen, and no
+     * resource_link was sent. A dismissed file keeps its own chip, so the
+     * state stays visible and reversible.
      */
-    const selectionCoversActiveFile =
-      selection && selection.hasSelection && includeSelection;
+    const selectionCoversActiveFile = sendingSelection && includeActiveFile;
 
     // The file on screen comes first: it is the broadest bit of context, and
     // the selection chip below narrows it down.
@@ -1234,13 +1323,19 @@
      * thing, and no way to tell from the editor which was true. The editor
      * owns this: clear the highlight and the chip goes with it.
      */
-    if (selectionCoversActiveFile) {
+    if (sendingSelection) {
       const chip = document.createElement("span");
       chip.className = "chip chip-selection";
-      chip.title =
-        "Kiro gets " +
-        selection.relativePath +
-        " and the highlighted lines. Clear the highlight to stop sending them.";
+      // What is true depends on whether the file itself is going too. It said
+      // "Kiro gets <file> and the highlighted lines" either way, which was a
+      // plain untruth once the file chip had been dismissed.
+      chip.title = includeActiveFile
+        ? "Kiro gets " +
+          selection.relativePath +
+          " and the highlighted lines. Clear the highlight to stop sending them."
+        : "Kiro gets the highlighted lines of " +
+          selection.relativePath +
+          ", but not the rest of the file. Clear the highlight to stop sending them.";
 
       // The range is the whole label. A separate "1 line" badge repeated what
       // 26-26 already said.
@@ -1289,6 +1384,25 @@
       chip.appendChild(x);
 
       chipsEl.appendChild(chip);
+    }
+
+    /*
+     * Attachments outlive the message they were sent with, so the row needs a
+     * way out that is not clicking × five times. It appears only when there is
+     * more than one thing of the user's own to clear — with a single chip the
+     * × beside it is already the shorter route — and it never touches the file
+     * or selection chips, which the editor owns rather than this button.
+     */
+    if (attachments.length > 1) {
+      const clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "chip chip-muted chips-clear";
+      clear.title = "Remove every file, folder and image attached to the next message";
+      clear.textContent = "Clear all";
+      clear.addEventListener("click", () =>
+        vscode.postMessage({ type: "clearAttachments" })
+      );
+      chipsEl.appendChild(clear);
     }
 
     chipsEl.hidden = chipsEl.children.length === 0;
@@ -1507,7 +1621,15 @@
     // used to start a second turn on top of the running one.
     if (busy) return;
     const text = inputEl.value.trim();
-    if (!text && attachments.length === 0) return;
+    /*
+     * "Look at these" with no words is a real message, but only the first
+     * time. Attachments stay on the row after they have been sent, so without
+     * the `carried` check Enter on an empty box would start a whole turn out
+     * of chips the user had already sent — costing credits and running Kiro
+     * against a message nobody wrote.
+     */
+    const somethingNew = attachments.some((a) => !a.carried);
+    if (!text && !somethingNew) return;
     inputEl.value = "";
     resize();
     vscode.postMessage({
@@ -2258,6 +2380,24 @@
       case "chunk": {
         const was = atBottom();
         const bubble = ensureAgentBubble();
+        /*
+         * Text that resumes after a tool call starts a new paragraph.
+         *
+         * Kiro says something, calls a tool, then says something else, and
+         * all of it is appended to one buffer — so the two ran together as
+         * "…rather than guessing from names.I notice RENEWAL_WINDOW_CLOSED…",
+         * with no space, let alone a break. Nothing in the stream separates
+         * one message from the next, but a tool starting is a boundary we can
+         * see: whatever was being said had finished being said.
+         *
+         * The flag is set only when a tool row is *created*, never on a
+         * status update for a tool already on screen — those arrive while
+         * text is streaming and would split a sentence in half.
+         */
+        if (breakBeforeText && buffer && !/\n\s*$/.test(buffer)) {
+          buffer += "\n\n";
+        }
+        breakBeforeText = false;
         // The reply itself has arrived, so it replaces "Working…".
         buffer += message.text;
         // A bare blinking block with nothing before it is not a reply. The
@@ -2277,6 +2417,10 @@
           row.className = "tool";
           row.dataset.id = id;
           bubble.tools.appendChild(row);
+          // A step Kiro has just decided on, not a status change to one
+          // already listed: whatever it was saying before this is finished,
+          // so the next text starts a paragraph rather than running on.
+          breakBeforeText = true;
         }
         // A tool can arrive by a route that never posted a userMessage, so
         // the header is started here too rather than assumed to be running.

@@ -66,6 +66,18 @@ test("the attachment it builds is a real one the rest of the code understands", 
   assert.ok(made.id, "it needs an id so the chip can be removed");
 });
 
+/*
+ * The id prefix marks it for the chip row; `source` marks it for the prompt.
+ * Without the second one `buildBlocks` cannot tell the file that merely
+ * happens to be focused from a file the user picked, and lists the two side
+ * by side as though they were the same kind of request.
+ */
+test("the automatic one says that it is automatic", () => {
+  const made = activeFileAttachment({ path: "C:\\kiro-chat\\src\\usage.ts", label: "src/usage.ts" });
+  assert.equal(made.source, "active");
+  assert.match(made.id, /^active:/, "and the chip row's marker is still there too");
+});
+
 // ---- path comparison -------------------------------------------------
 
 test("the same file spelled differently is the same file", () => {

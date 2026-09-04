@@ -1,5 +1,73 @@
 # Changelog
 
+## 0.26.0
+
+- **Tables in a reply are rendered as tables.** There was no table support at all, so every
+  row fell through to the paragraph branch: a table arrived as one line per row with a gap
+  between each, and the `|---|---|` separator printed as literal dashes. Any "here is the
+  mapping" answer — which is most long answers — came out as a wall of pipes. Alignment
+  markers are honoured, short rows are padded rather than dropped, and the table scrolls
+  inside its own box so a wide one does not drag the whole conversation sideways.
+
+  Prose is not mistaken for a table: the separator row has to describe the same number of
+  columns as the header, so a sentence containing a `|` above a `---` rule stays a
+  sentence. Escaped pipes, optional outer pipes and over-long rows all follow GitHub's
+  rules.
+
+  A table is drawn the way a chat draws one — a rule under the header, hairlines between
+  rows, rounded edge — rather than as a full bordered grid, which reads as a spreadsheet
+  pasted into a conversation. Words are never broken, so an identifier stays whole rather
+  than arriving as `SOURCE_NOT_REN` / `EWABLE`; a table asks for the width its own content
+  needs, so a short one stays small and quiet and only a genuinely wide one scrolls.
+
+- **Kiro's sentences no longer run into each other across a tool call.** Text said before a
+  step and text said after it went into the same buffer with nothing between, so a reply
+  read "…rather than guessing from names.I notice RENEWAL_WINDOW_CLOSED…" — no space, no
+  break. A new step now ends the paragraph. Only a step being started counts; a status
+  update for one already on screen arrives mid-sentence and is left alone.
+
+- **Files you attach now stay attached.** The chip row was emptied after every message, so
+  "add another file to the context" was true for exactly one turn: the second message
+  carried strictly less than the first. Because the `◎` chip for the file you are looking
+  at comes back on its own, the row still looked populated, and nothing anywhere said the
+  rest had gone. Files and folders now stay until you remove them — with their ×, or with
+  **Clear all**, which appears once there is more than one.
+
+  An image is still consumed by the message it goes with. Its data rides in the prompt
+  itself rather than as a link, so a sticky one would push megabytes through every turn for
+  a picture Kiro has already been shown.
+
+  Chips that have already gone cannot start a turn on their own: Enter on an empty box does
+  nothing unless something on the row is new. "Look at these" with no words still works —
+  once.
+
+- **Kiro is no longer handed the same file as two different files.** The file you were
+  looking at was listed by its absolute path under "Files to look at" and then again,
+  relatively, by the selection block — `C:\kiro-chat\media\chat.js` and `media/chat.js`,
+  two spellings that do not read as one file. The narrower mention wins now: whatever the
+  selection block already names is not listed above it. The link Kiro opens the file by is
+  untouched, so nothing it can act on was lost.
+
+- **The tab that merely happens to be focused is no longer listed as a file you chose.** It
+  sat among the attachments with nothing to tell it apart, so "update these files" quietly
+  took in whatever was open. With `kiroChat.sendSelection` off it now gets its own line
+  saying what it is; with the selection on, the selection block was already saying it.
+
+- **Fixed a chip that promised something the panel had decided not to do.** Dismissing the
+  `◎` chip with its × and then highlighting code in that same file made the file chip
+  vanish behind the selection chip — whose tooltip read "Kiro gets `<file>` and the
+  highlighted lines" while no link for the file was sent, and whose × was now off screen,
+  so there was nothing left to put it right. A dismissed file keeps its own chip, and the
+  selection chip's tooltip says which of the two situations you are in.
+
+- **Fixed the "add it back" chip painting solid blue under the pointer.** `button:hover` is
+  a type plus a pseudo-class and outranks any single class, so a button that only sets a
+  background of its own is repainted the moment the pointer crosses it. The test that
+  guards against this looked for `background: none`; this one says `background: transparent`
+  and slipped past. A second test now reads the classes off every button `chat.js` builds
+  and asks the question the right way round — it found a fifth candidate while being
+  written, which turned out to be already handled.
+
 ## 0.25.1
 
 - **A file Kiro only read no longer opens a review when something else changes it.** 0.25.0

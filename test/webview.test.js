@@ -181,8 +181,13 @@ test("a button styled to look plain cancels the global hover too", () => {
 test("the file chip and the selection chip do not both name the same file", () => {
   assert.match(
     js,
-    /const selectionCoversActiveFile =\s*\n?\s*selection && selection\.hasSelection && includeSelection/,
-    "the selection chip has to stand in for the file chip"
+    /const sendingSelection = Boolean\(\s*\n?\s*selection && selection\.hasSelection && includeSelection/,
+    "whether the highlighted lines are going is one question"
+  );
+  assert.match(
+    js,
+    /const selectionCoversActiveFile = sendingSelection && includeActiveFile;/,
+    "and whether the selection chip may stand in for the file chip is another"
   );
   const render = js.slice(js.indexOf("function renderChips()"));
   const body = render.slice(0, render.indexOf("\n  function "));
@@ -206,6 +211,15 @@ test("the file chip and the selection chip do not both name the same file", () =
   const bubble = js.slice(js.indexOf("function addUserBubble(message)"));
   const tags = bubble.slice(0, bubble.indexOf("messagesEl.appendChild(node)"));
   assert.match(tags, /samePathish\(a\.label, selected\)/, "the range stands in for the file");
+  // Only for the file that was added automatically, though. One attached by
+  // hand is a separate thing the user did and is still sent as its own link,
+  // so hiding it would leave no record in the transcript that it went.
+  assert.match(
+    tags,
+    /a\.source === "active" && samePathish/,
+    "and only the automatic one may be stood in for"
+  );
+  assert.match(provider, /source: a\.source \?\? "user"/, "so the provider has to say which");
   assert.match(tags, /replace\(\/:\\d\+-\\d\+\$\/, ""\)/, "which means stripping the range off");
   assert.match(tags, /fileName\(a\.label\)/, "and both are named, not pathed");
   assert.match(tags, /fileName\(selected\)/);
@@ -223,7 +237,7 @@ test("the selection chip cannot be dismissed while the code is highlighted", () 
   const render = js.slice(js.indexOf("function renderChips()"));
   const body = render.slice(0, render.indexOf("\n  function "));
   // These files are CRLF, so slice on a pattern rather than a literal newline.
-  const from = body.search(/if \(selectionCoversActiveFile\) \{\s*\n\s*const chip/);
+  const from = body.search(/if \(sendingSelection\) \{\s*\n\s*const chip/);
   assert.ok(from > -1, "the selection chip block should be findable");
   const chip = body.slice(from);
   const to = chip.search(/for \(const a of attachments\)/);
@@ -345,6 +359,172 @@ test("backticks inside a sentence do not open a code block", () => {
   assert.equal(pattern.test("```js\nlet a = 1;"), true, "and an unfinished one still renders");
 });
 
+/**
+ * The markdown renderer, lifted out of `chat.js` and actually run.
+ *
+ * Everything from `escapeHtml` to the end of `renderMarkdown` is contiguous
+ * and depends on nothing outside itself, so it evaluates on its own. Asserting
+ * on the shape of the source can only say the code looks right; a reply
+ * arriving unreadable is a behaviour, and these are the tests that can check
+ * the behaviour rather than the spelling.
+ */
+function loadRenderer() {
+  const from = js.indexOf("function escapeHtml");
+  const to = js.indexOf("async function copyText");
+  assert.ok(from > -1 && to > from, "the renderer should be findable in chat.js");
+  return new Function(js.slice(from, to) + "\nreturn renderMarkdown;")();
+}
+
+/*
+ * Tables came out as a wall of pipes.
+ *
+ * Every row fell through to the paragraph branch, so each became its own <p>
+ * with a margin between, and `|---|---|` printed as literal dashes. Agents
+ * answer with tables constantly — any "here is the mapping" reply is one — so
+ * this was most of a long answer arriving unreadable.
+ */
+test("a pipe table is rendered as a table", () => {
+  const html = loadRenderer()(
+    "Here is the mapping:\n\n" +
+      "| Case | Condition |\n|---|---|\n" +
+      "| SOURCE_NOT_RENEWABLE | `isRenewableSource()` is false |\n" +
+      "| RENEWAL_IN_PROGRESS | a sibling exists |\n\n" +
+      "Note the order."
+  );
+  assert.match(html, /<table>/, "a pipe table has to become a table");
+  assert.equal((html.match(/<tr>/g) ?? []).length, 3, "a header row and two body rows");
+  assert.match(html, /<th>Case<\/th>/);
+  assert.match(
+    html,
+    /<td><code>isRenewableSource\(\)<\/code> is false<\/td>/,
+    "cells are inline markdown, not flat text"
+  );
+  assert.doesNotMatch(html, /\|---\|/, "and the delimiter row is not printed as content");
+  assert.doesNotMatch(html, /<p>\|/, "no row may fall through to a paragraph");
+
+  // A table is the one thing in a reply with a width of its own, and this
+  // panel is often a sidebar. It scrolls inside itself or it widens the
+  // whole transcript.
+  assert.match(html, /class="table-wrap"/);
+  assert.match(css, /^\.table-wrap \{/m);
+  assert.match(css, /overflow-x: auto/);
+});
+
+/*
+ * A table asks for the width its content needs — no more, no less.
+ *
+ * Two versions of this were wrong in opposite directions.
+ * `overflow-wrap: anywhere` broke words at any character, so the first column
+ * — in a mapping table always an identifier — rendered as "SOURCE_NOT_REN /
+ * EWABLE". A flat `min-width: 8em` per cell fixed that and priced every table
+ * the same, so "| a | b | c |" scrolled in a panel with room to spare.
+ *
+ * Letting the content ask for its own width does both, and is the browser's
+ * default: the job is to not override it.
+ */
+test("a table is as wide as its content, and never breaks a word", () => {
+  const rule = css.slice(css.indexOf(".table-wrap th,"));
+  // Declarations only. The comment inside this rule names the values it
+  // rejected, and reading those as declarations failed the test on its own
+  // explanation.
+  const body = rule.slice(0, rule.indexOf("\n}")).replace(/\/\*[\s\S]*?\*\//g, "");
+  assert.match(body, /overflow-wrap: normal/, "a word is never broken");
+  assert.match(body, /word-break: normal/);
+  assert.doesNotMatch(body, /overflow-wrap: (anywhere|break-word)/, "not even as a last resort");
+  assert.doesNotMatch(body, /min-width:/, "and a short table must not be priced like a long one");
+});
+
+/*
+ * A rule under the header and hairlines between rows, not a full grid.
+ * Bordering every cell draws the container rather than the content, and at
+ * chat width the vertical lines are pure noise.
+ */
+test("a table reads as prose, not as a spreadsheet", () => {
+  assert.match(css, /^\.table-wrap th \{[^}]*border-bottom:/m, "the header gets a rule");
+  assert.match(css, /^\.table-wrap tbody tr \+ tr td \{[^}]*border-top:/m, "rows get hairlines");
+  const cells = css.slice(css.indexOf(".table-wrap th,"));
+  assert.doesNotMatch(
+    cells.slice(0, cells.indexOf("}")),
+    /^\s*border: /m,
+    "and no cell draws a box around itself"
+  );
+  assert.doesNotMatch(css, /\.table-wrap tbody tr:nth-child/, "no zebra striping either");
+});
+
+test("column alignment markers are honoured", () => {
+  const html = loadRenderer()("| L | C | R |\n|:---|:---:|---:|\n| a | b | c |");
+  assert.match(html, /<th style="text-align:center">C<\/th>/);
+  assert.match(html, /<th style="text-align:right">R<\/th>/);
+  assert.match(html, /<td style="text-align:right">c<\/td>/, "the body follows the header");
+  assert.doesNotMatch(html, /text-align:left/, "left is the default, not a style to write");
+});
+
+/*
+ * The guard matters more than the feature. A line with a pipe in it above a
+ * line of dashes is ordinary prose over a horizontal rule, and turning that
+ * into a table would be a worse bug than the one being fixed — which is why
+ * the delimiter's cell count has to match the header's, as GFM says.
+ */
+test("prose that merely contains a pipe is not a table", () => {
+  const render = loadRenderer();
+  assert.doesNotMatch(render("use grep | wc -l for this\n---\nnext"), /<table>/);
+  assert.doesNotMatch(
+    render("| a | b | c |\n|---|---|\n| 1 | 2 | 3 |"),
+    /<table>/,
+    "the delimiter has to describe the same number of columns"
+  );
+  assert.doesNotMatch(
+    render("```js\nconst a = b | c;\n```"),
+    /<table>/,
+    "and a fenced block is never read for tables at all"
+  );
+});
+
+test("a short row is padded rather than dropped", () => {
+  // A ragged table still reads; a missing cell shifts every column after it.
+  const html = loadRenderer()("| a | b | c |\n|---|---|---|\n| 1 |");
+  assert.equal((html.match(/<td/g) ?? []).length, 3, "the row keeps its columns");
+});
+
+test("tables without outer pipes still count", () => {
+  assert.match(loadRenderer()("a | b\n--- | ---\n1 | 2"), /<th>a<\/th>/);
+});
+
+/*
+ * Kiro says something, calls a tool, then says something else — and all of it
+ * was appended to one buffer with nothing between, so the two ran together
+ * with no space at all: "…rather than guessing from names.I notice
+ * RENEWAL_WINDOW_CLOSED…". Nothing in the stream separates one message from
+ * the next, but a step starting is a boundary that can be seen.
+ */
+test("text that resumes after a tool step starts a new paragraph", () => {
+  assert.match(js, /let breakBeforeText = false;/, "the boundary needs somewhere to live");
+
+  const chunk = js.slice(js.indexOf('case "chunk": {'));
+  const chunkBody = chunk.slice(0, chunk.indexOf('case "tool": {'));
+  assert.ok(
+    chunkBody.includes("if (breakBeforeText && buffer && !/\\n\\s*$/.test(buffer))"),
+    "a break is inserted only when there is text to break from, and none already"
+  );
+  assert.ok(chunkBody.includes('buffer += "\\n\\n";'), "and it is a paragraph break");
+  assert.match(chunkBody, /breakBeforeText = false;/, "consumed, so it fires once");
+
+  /*
+   * Set where a row is *created*, never on a status update for a step already
+   * on screen — those arrive while text is still streaming and would split a
+   * sentence down the middle, which is the same bug pointing the other way.
+   */
+  const tool = js.slice(js.indexOf('case "tool": {'));
+  const toolBody = tool.slice(0, tool.indexOf("\n      case "));
+  const created = toolBody.slice(toolBody.indexOf("if (!row) {"), toolBody.indexOf("startThinking()"));
+  assert.match(created, /breakBeforeText = true;/, "a step Kiro has just decided on");
+  assert.equal(
+    (toolBody.match(/breakBeforeText = true;/g) ?? []).length,
+    1,
+    "and only there — a status update for a listed step is not a boundary"
+  );
+});
+
 test("the transcript says when Kiro is working, and for how long", () => {
   assert.match(js, /function startThinking\(\)/);
   assert.match(js, /function stopThinking\(/);
@@ -379,8 +559,10 @@ test("the transcript says when Kiro is working, and for how long", () => {
     /body\.className = "body cursor"/,
     "the cursor belongs to text that exists"
   );
+  // The case, not a fixed 500 characters of it — a comment added inside was
+  // enough to push the line out of the window and fail this for nothing.
   assert.match(
-    chunk.slice(0, 500),
+    chunk.slice(0, chunk.indexOf('case "tool": {')),
     /classList\.toggle\("cursor", Boolean\(buffer\.trim\(\)\)\)/,
     "and not to an empty buffer"
   );
@@ -740,9 +922,11 @@ test("a ready session dismisses the setup screen however it connected", () => {
  */
 test("image attachments reach the webview as something it can draw", () => {
   assert.match(provider, /previewOf/, "the provider must build a preview for images");
+  // The method, not a fixed 400 characters of it: a comment added inside was
+  // enough to push `preview:` out of the window and fail this for nothing.
   const posted = provider.slice(provider.indexOf("private postAttachments"));
   assert.match(
-    posted.slice(0, 400),
+    posted.slice(0, posted.indexOf("\n  private ")),
     /preview:/,
     "postAttachments must include the preview, not just the label"
   );
@@ -1139,10 +1323,164 @@ test("the file you are looking at is not shown twice when already attached", () 
 
 /** Both the live chip and the dismissed "add it back" chip must respect it. */
 test("neither form of the active-file chip duplicates an attachment", () => {
+  // The whole function, not a fixed slice of it: counting inside the first
+  // 2600 characters made this fail for a comment being added above the chips.
   const render = js.slice(js.indexOf("function renderChips"));
-  const body = render.slice(0, 2600);
+  const body = render.slice(0, render.indexOf("\n  function "));
   const guards = body.match(/!activeAlreadyAttached/g) ?? [];
   assert.equal(guards.length, 2, "both the live and the muted chip need the guard");
+});
+
+/*
+ * Dismissing the file chip, then highlighting something in that same file.
+ *
+ * The selection chip stood in for the file chip whenever a selection was
+ * being sent — including when the file had been dismissed and so was not
+ * being sent at all. The file chip vanished, its × went with it, and all that
+ * was left on screen was a chip whose tooltip read "Kiro gets <file> and the
+ * highlighted lines" while no resource_link went out. The panel asserted
+ * something it had itself decided not to do, and left no control to undo it.
+ */
+test("a dismissed file chip does not hide behind the selection chip", () => {
+  const render = js.slice(js.indexOf("function renderChips()"));
+  const body = render.slice(0, render.indexOf("\n  function "));
+
+  assert.match(
+    body,
+    /const selectionCoversActiveFile = sendingSelection && includeActiveFile;/,
+    "a file that is not going cannot be stood in for"
+  );
+  assert.match(body, /includeActiveFile = true;/, "and the muted chip adds it back");
+
+  // And the tooltip has to say which of the two situations it is.
+  const title = body.slice(body.indexOf("chip.title = includeActiveFile"), body.length);
+  assert.ok(title.length > 0, "the selection chip's title must depend on it");
+  assert.match(title.slice(0, 500), /and the highlighted lines/, "the file plus the lines");
+  assert.match(
+    title.slice(0, 500),
+    /but not the rest of the file/,
+    "or the lines alone, once the file has been dismissed"
+  );
+});
+
+/*
+ * "I add another file to add on the context" only ever held for one message.
+ *
+ * The row was emptied after every send, so the second message carried
+ * strictly less than the first — and because the automatic file chip comes
+ * back on its own the row still looked populated, so nothing on screen said
+ * the rest had gone. Files and folders stay now. An image does not: its
+ * base64 rides in the prompt itself, and a sticky one would re-send megabytes
+ * every turn for a picture Kiro has already been shown.
+ */
+test("attached files outlive the message, and images do not", () => {
+  const send = provider.slice(provider.indexOf("async send("));
+  const body = send.slice(0, send.indexOf("\n  async sendFromEditor"));
+  assert.match(
+    body,
+    /this\.attachments\s*\r?\n?\s*\.filter\(\(a\) => a\.kind !== "image"\)/,
+    "files and folders survive the send; images are consumed by it"
+  );
+  assert.doesNotMatch(
+    body,
+    /this\.attachments = \[\];/,
+    "which means the row is no longer emptied wholesale after a turn"
+  );
+  // Starting a different conversation is the other matter entirely.
+  assert.match(provider, /this\.attachments = \[\];/, "a new chat still clears it");
+});
+
+/*
+ * With chips left on the row, Enter on an empty box would have started a real
+ * turn out of things already sent — credits spent on a message nobody wrote.
+ * "Look at these" with no words is a genuine message, but only the once, so
+ * what the guard asks is whether anything on the row is new.
+ */
+test("a blank composer cannot re-send chips that already went", () => {
+  assert.match(provider, /carried: true/, "the provider marks what it has already sent");
+  assert.match(provider, /carried: a\.carried === true/, "and passes the mark down");
+  assert.match(
+    js,
+    /const somethingNew = attachments\.some\(\(a\) => !a\.carried\);/,
+    "and the composer asks whether anything is new before sending nothing"
+  );
+  assert.match(js, /if \(!text && !somethingNew\) return;/);
+  assert.match(
+    provider,
+    /if \(!trimmed && !this\.attachments\.some\(\(a\) => a\.carried !== true\)\) return;/,
+    "the provider applies the same rule, for the paths that skip the webview"
+  );
+});
+
+/*
+ * Attachments outlive the message they were sent with, so the row needs a way
+ * to be emptied. `clearAttachments` sat in the provider's switch for a long
+ * time with nothing posting it — the dead half of a contract. Both halves, as
+ * ever, or the control does nothing and says nothing about it.
+ */
+test("the chip row can be cleared, and both halves of that exist", () => {
+  assert.match(js, /chips-clear/, "the control needs its class");
+  assert.match(
+    js,
+    /vscode\.postMessage\(\{ type: "clearAttachments" \}\)/,
+    "the webview has to post it"
+  );
+  assert.match(provider, /case "clearAttachments":/, "and the provider has to handle it");
+  // A single chip already has an × beside it, so a second control for the
+  // same job is noise. The row only offers this past one.
+  const render = js.slice(js.indexOf("function renderChips()"));
+  const body = render.slice(0, render.indexOf("\n  function "));
+  assert.match(body, /if \(attachments\.length > 1\)/, "only worth it past one chip");
+});
+
+/*
+ * The `background: none` test above catches only the fully plain buttons.
+ * `.chip-muted` sets `background: transparent` and keeps a dashed border, so
+ * it slipped straight through and painted solid primary blue under the
+ * pointer — a fourth instance of a bug that has now shipped four times. The
+ * rule is about the global `button:hover`, not about any particular way of
+ * spelling "no background of my own", so ask it the right way round: every
+ * element this file builds as a <button> that restyles its background has to
+ * restyle its hover too.
+ */
+test("every button that restyles its background restyles its hover", () => {
+  const rules = [...css.replace(/\/\*[\s\S]*?\*\//g, "").matchAll(/([^{}]+)\{([^}]*)\}/g)];
+  const hovered = new Set();
+  const restyled = new Set();
+  for (const [, rawSelector, declarations] of rules) {
+    for (const selector of rawSelector.split(",").map((s) => s.trim())) {
+      // A hover rule need not be bare `.name:hover` — `.permission-option`
+      // guards its own with `:hover:not(:disabled)`, and that counts. What
+      // does not count is a descendant rule, which styles something else, so
+      // the class and the `:hover` have to sit in one compound selector.
+      const hover = /^\.([\w-]+)[^\s,]*:hover/.exec(selector);
+      if (hover) hovered.add(hover[1]);
+      const plain = /^\.([\w-]+)$/.exec(selector);
+      if (plain && /(^|[;\s])background(-color)?:/.test(declarations)) {
+        restyled.add(plain[1]);
+      }
+    }
+  }
+
+  const missing = [];
+  let found = 0;
+  for (const [, list] of js.matchAll(
+    /createElement\("button"\)[\s\S]{0,400}?\.className = "([^"]+)"/g
+  )) {
+    found += 1;
+    const names = list.split(/\s+/).filter(Boolean);
+    // Any one of the element's classes carrying a :hover is enough — the
+    // question is what the element does, not what each class does alone.
+    if (names.some((n) => restyled.has(n)) && !names.some((n) => hovered.has(n))) {
+      missing.push(list);
+    }
+  }
+  assert.ok(found >= 4, `expected several built buttons, found ${found}`);
+  assert.deepEqual(
+    missing,
+    [],
+    `these paint solid blue on hover, nothing outranking button:hover: ${missing.join(" | ")}`
+  );
 });
 
 

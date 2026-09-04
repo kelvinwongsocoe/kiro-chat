@@ -763,6 +763,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         kind: a.kind,
         label: a.label,
         path: a.path,
+        // Already sent with an earlier message. The chip row uses it to
+        // decide whether a blank composer has anything new to say.
+        carried: a.carried === true,
         preview: this.previewOf(a),
       })),
     });
@@ -792,7 +795,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     modeValue: unknown = "default"
   ): Promise<void> {
     const trimmed = text.trim();
-    if (!trimmed && this.attachments.length === 0) return;
+    // Same rule the composer applies: chips that have already gone are not on
+    // their own a message. A command reaching here always brings text.
+    if (!trimmed && !this.attachments.some((a) => a.carried !== true)) return;
 
     /*
      * Refused before the bubble is posted, not after.
@@ -830,6 +835,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       attachments: attached.map((a) => ({
         kind: a.kind,
         label: a.label,
+        // Which chip may step aside for the selection tag. Only the automatic
+        // one may: a file attached by hand is a separate thing the user did,
+        // and hiding it under a range they happen to have highlighted loses
+        // the only record that it went.
+        source: a.source ?? "user",
         preview: this.previewOf(a),
       })),
       selection:
@@ -843,7 +853,28 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
       mode
     );
 
-    this.attachments = [];
+    /*
+     * Files and folders stay attached; an image does not.
+     *
+     * Clearing the whole row after every message meant "add another file to
+     * the context" was only ever true for one message: the second message
+     * carried strictly less than the first, the automatic file chip came back
+     * on its own so the row still looked populated, and nothing anywhere said
+     * the rest had gone. A file reference costs a path — keeping it is what
+     * the chip already implies. An image is the opposite: its base64 rides in
+     * the prompt itself, so a sticky one would re-send megabytes every turn
+     * for a picture Kiro has already been shown. Remove one with its ×, or
+     * clear the row from the chip bar.
+     */
+    this.attachments = this.attachments
+      .filter((a) => a.kind !== "image")
+      // Marked as carried so an empty box cannot send them a second time on
+      // its own. Enter on a blank composer used to be a no-op; with the row
+      // still full it would start a real turn, which costs credits and runs
+      // Kiro against a message the user never wrote. Attaching something new
+      // clears the mark, because "look at this" with no words is a real thing
+      // to send — once.
+      .map((a) => ({ ...a, carried: true }));
     this.postAttachments();
 
     this.everConnected = true;

@@ -7,10 +7,24 @@
  * decisions here can be exercised on their own; see `test/promptBlocks.test.js`.
  */
 
+import { samePath } from "./paths";
+
 /** Something the user attached to the next message. */
 export interface Attachment {
   id: string;
   kind: "file" | "folder" | "image";
+  /**
+   * Where it came from. `active` is the file the editor happens to be
+   * showing, added for you; anything else you attached on purpose. The
+   * difference is worth carrying: one is a request, the other is ambient.
+   */
+  source?: "user" | "active";
+  /**
+   * True once it has gone with a message. Files and folders stay attached
+   * across turns, so this is what stops a blank composer sending them again
+   * on its own; attaching something new starts it false.
+   */
+  carried?: boolean;
   /** Short label shown on the chip. */
   label: string;
   /** Full path, for files and folders. */
@@ -114,9 +128,29 @@ export function buildBlocks(
   const folders = list.filter((a) => a.kind === "folder" && a.path);
   const images = list.filter((a) => a.kind === "image" && a.data);
 
-  if (files.length > 0) {
+  // The file the selection block is about, when that block is really going.
+  const selectionPath = includeSelection && selection ? selection.fsPath : "";
+
+  /*
+   * One mention per file, and the narrowest mention wins.
+   *
+   * The file being looked at was listed by its absolute path under "Files to
+   * look at" and then again, relatively, by the selection block below —
+   * C:\kiro-chat\media\chat.js and media/chat.js, two spellings that do not
+   * look like one file. The selection block says everything that entry said
+   * and adds the line range, so the entry steps aside. Nothing Kiro can act
+   * on is lost: the resource_link still carries the URI. This is the rule the
+   * chip row and the sent message already apply on screen.
+   */
+  const namedBySelection = (a: Attachment) =>
+    Boolean(selectionPath) && samePath(a.path, selectionPath);
+
+  const chosen = files.filter((f) => f.source !== "active" && !namedBySelection(f));
+  const open = files.filter((f) => f.source === "active" && !namedBySelection(f));
+
+  if (chosen.length > 0) {
     notes.push("", "Files to look at:");
-    for (const f of files) {
+    for (const f of chosen) {
       notes.push(`- ${f.path}`);
     }
   }
@@ -125,6 +159,18 @@ export function buildBlocks(
     for (const f of folders) {
       notes.push(`- ${f.path}`);
     }
+  }
+
+  /*
+   * The file on screen is ambient, and saying so is the point.
+   *
+   * Listed among the files the user picked it read as one of them, so "update
+   * these files" quietly took in whatever tab happened to be focused. It only
+   * reaches here when the selection block is not already naming it — that is,
+   * with kiroChat.sendSelection off.
+   */
+  for (const f of open) {
+    notes.push("", `The file I have open is ${f.path}.`);
   }
 
   if (includeSelection && selection) {
