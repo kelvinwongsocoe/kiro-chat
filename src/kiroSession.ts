@@ -5,7 +5,7 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { AcpClient } from "./acpClient";
 import { ActiveReviewInfo, ChangeReviewer } from "./changeReviewer";
-import { isWriteLikeTool } from "./writeTools";
+import { isReadOnlyTool, isWriteLikeTool } from "./writeTools";
 import { changedSinceBaseline, describeChange, TurnChange } from "./turnChanges";
 import { findKiro } from "./findKiro";
 import { isInsideAnyRoot, isInsideRoot } from "./workspacePaths";
@@ -1132,8 +1132,26 @@ export class KiroSession {
    * an unreviewed edit is the one outcome nobody wants.
    */
   private observeToolPaths(update: any): void {
+    /*
+     * Snapshot everything; only offer a diff for what might have been written.
+     *
+     * The snapshot is taken either way — it costs a read, and a later
+     * unrecognised write to the same file needs a "before" that predates it.
+     * What a read does not earn is a *review*. 0.25.0 reviewed any snapshotted
+     * file that differed at the end of the turn, which meant a file Kiro merely
+     * read could open a diff when something outside Kiro — a watcher, a
+     * formatter, a dev server — rewrote it mid-turn, and rejecting that diff
+     * would clobber a write Kiro never made.
+     *
+     * `isReadOnlyTool` answers false for anything it does not recognise, so an
+     * unknown tool still earns a review. Only a kind that positively cannot
+     * write opts out, and the change still reaches the keep-or-undo card,
+     * which is the gentler surface for "this changed, was that you?".
+     */
+    const reviewable = !isReadOnlyTool(update);
     for (const full of this.pathsMentionedBy(update)) {
-      if (this.captureBaseline(full)) this.toolTouchedPaths.add(this.pathKey(full));
+      if (!this.captureBaseline(full)) continue;
+      if (reviewable) this.toolTouchedPaths.add(this.pathKey(full));
     }
 
     // Shared with askPermission, which uses the same answer to decide that an

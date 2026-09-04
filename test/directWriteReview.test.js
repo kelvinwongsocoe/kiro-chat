@@ -757,7 +757,10 @@ async function exerciseTool({ update, action = "reject", attach = false, write =
   try {
     const vscode = fakeVscode(folder, action);
     const KiroSession = loadSession(vscode);
-    const session = new KiroSession({ appendLine() {} }, events());
+    const reported = [];
+    const handlers = events();
+    handlers.onTurnChanges = (summary) => reported.push(summary);
+    const session = new KiroSession({ appendLine() {} }, handlers);
 
     session.beginTurnFileCapture(
       attach
@@ -769,7 +772,9 @@ async function exerciseTool({ update, action = "reject", attach = false, write =
     // Kiro CLI performing the write itself, inside its own tool.
     if (write) fs.writeFileSync(file, after);
     await session.finishDirectFileReviews();
-    return { content: fs.readFileSync(file, "utf8"), before, after };
+    // The keep-or-undo card, which a real turn posts straight afterwards.
+    session.reportTurnChanges();
+    return { content: fs.readFileSync(file, "utf8"), before, after, reported };
   } finally {
     if (fs.existsSync(file)) fs.unlinkSync(file);
     fs.rmdirSync(folder);
@@ -816,8 +821,16 @@ test("a write whose path is only in rawInput.operations is found", async () => {
   assert.equal(result.content, result.before, "the path in operations[] has to be found");
 });
 
-/** A read is the strongest hint an edit is coming, so it earns a snapshot. */
-test("a file only ever read is still snapshotted, and reviewed if it changes", async () => {
+/**
+ * A read earns a snapshot but not a diff.
+ *
+ * 0.25.0 reviewed anything snapshotted that differed by the end of the turn,
+ * which swept in files Kiro had only read — so a watcher, a formatter or a dev
+ * server rewriting one mid-turn opened a diff, and rejecting it would have
+ * clobbered a write Kiro never made. The change still has to be *reported*
+ * though; going quiet about it would be the original bug again.
+ */
+test("a file only ever read is reported, not opened as a diff", async () => {
   const result = await exerciseTool({
     update: (file) => ({
       sessionUpdate: "tool_call",
@@ -826,10 +839,38 @@ test("a file only ever read is still snapshotted, and reviewed if it changes", a
       kind: "read",
       locations: [{ path: file }],
     }),
+    // Would restore the file if a review had opened for it.
     action: "reject",
   });
 
-  assert.equal(result.content, result.before);
+  assert.equal(
+    result.content,
+    result.after,
+    "a file Kiro only read must not be restored over by a review it never earned"
+  );
+  assert.equal(result.reported.length, 1, "but the change still has to be reported");
+  assert.equal(result.reported[0].files.length, 1);
+  assert.match(result.reported[0].files[0].path, /example\.js$/);
+});
+
+/** An unknown tool is assumed to have written, which is what keeps 0.25.0's fix. */
+test("an unrecognised tool still earns a review, unlike a read", async () => {
+  const result = await exerciseTool({
+    update: (file) => ({
+      sessionUpdate: "tool_call",
+      toolCallId: "mystery-3",
+      title: "Doing something to example.js",
+      kind: "something_new",
+      locations: [{ path: file }],
+    }),
+    action: "reject",
+  });
+
+  assert.equal(
+    result.content,
+    result.before,
+    "only a kind that positively cannot write may opt out of review"
+  );
 });
 
 /**

@@ -225,6 +225,15 @@ reviews whatever differs from its baseline; the heuristic only decides whether t
 `rawInput.operations[].path`, because Kiro uses all three and only the middle one was
 being read.
 
+**A snapshot and a review are not the same entitlement.** Every mentioned path is
+snapshotted; only a path from a tool that *might* have written joins `toolTouchedPaths` and
+so earns a diff. `isReadOnlyTool` (`writeTools.ts`, beside its counterpart) returns false for
+anything it does not recognise — an unknown tool is assumed to have written, which is what
+keeps the paragraph above true. Only `read`/`search`/`grep`/`glob`/`list`/`fetch`/`think` opt
+out, and their changes still reach the keep-or-undo card. Without that split, a file Kiro
+merely read opened a diff whenever a watcher or formatter rewrote it mid-turn, and rejecting
+it would have clobbered a write Kiro never made.
+
 Baselines taken from prompt attachments are deliberately **not** in `toolTouchedPaths`. A
 file gets a snapshot either because a tool touched it or because the user attached it, and
 only the first means Kiro was working on it — reviewing the second would offer to undo the

@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.25.1
+
+- **A file Kiro only read no longer opens a review when something else changes it.** 0.25.0
+  reviewed any snapshotted file that differed by the end of the turn, which was the right
+  question for a file Kiro wrote and the wrong one for a file it merely read: a watcher, a
+  formatter or a dev server rewriting one mid-turn opened a diff, and rejecting that diff
+  would have clobbered a write Kiro never made.
+
+  The snapshot is still taken either way — it costs one read, and a later unrecognised write
+  to the same file needs a "before" that predates it. What a read no longer earns is the
+  diff. The change is still reported in the keep-or-undo card, which is the gentler surface
+  for "this changed, was that you?"; going quiet about it would be the original bug again.
+
+- **`isReadOnlyTool` answers false for anything it does not recognise**, and that asymmetry
+  is the whole design. An unknown tool is assumed to have written, so 0.25.0's fix for
+  unreviewed edits is untouched — only a kind that positively cannot write (`read`,
+  `search`, `grep`, `glob`, `list`, `fetch`, `think`) opts a file out. `execute`/`shell` are
+  deliberately absent: a command can write anything, and `terminal: false` is not a proof.
+
 ## 0.25.0
 
 - **An edit made by a tool the extension did not recognise no longer lands unreviewed.**

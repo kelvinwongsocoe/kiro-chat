@@ -44,3 +44,26 @@ export function isWriteLikeTool(update: unknown): boolean {
   const command = normaliseKind(raw?.command ?? raw?.mode);
   return WRITE_COMMANDS.includes(command);
 }
+
+/** Kinds that cannot change a file, whatever else they do. */
+const READ_ONLY_KINDS = ["read", "search", "grep", "glob", "list", "fetch", "think"];
+
+/**
+ * True when this tool call is one that positively cannot have written the file.
+ *
+ * The default answer is **false**, and that asymmetry is the point. An unknown
+ * tool is treated as one that might have written, which is what keeps an
+ * unrecognised edit reviewable — the whole of the 0.25.0 fix. Only a kind on
+ * this list, and only when it is not also write-like, opts a file out.
+ *
+ * `execute` / `shell` are deliberately absent: a command can write anything.
+ * They should never appear, since the client advertises `terminal: false`, but
+ * being wrong about them here would silently skip a review.
+ */
+export function isReadOnlyTool(update: unknown): boolean {
+  if (!update || typeof update !== "object") return false;
+  if (isWriteLikeTool(update)) return false;
+  const value = update as any;
+  const kind = normaliseKind(value.kind ?? value.toolCall?.kind);
+  return READ_ONLY_KINDS.includes(kind);
+}
