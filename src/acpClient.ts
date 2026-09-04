@@ -32,6 +32,41 @@ export function quote(value: string): string {
   return /[\s&|<>^()]/.test(value) ? `"${value}"` : value;
 }
 
+/**
+ * How to kill what `start` actually spawned.
+ *
+ * A `.cmd` or `.bat` shim is run through the shell, so the child this class
+ * holds is cmd.exe and `kiro-cli` is its *grandchild*. `proc.kill()` reaches
+ * only the shell, leaving the real agent running — and with it the ACP session
+ * and its lock on the workspace. Restarting the agent a few times that way
+ * leaves a trail of live kiro-cli processes behind.
+ *
+ * Windows has no process group to signal, so the whole tree goes through
+ * taskkill. Returns undefined whenever an ordinary kill() is the right thing:
+ * a real .exe we spawned directly, or any other platform.
+ */
+export function killArgs(
+  pid: number | undefined,
+  viaShell: boolean,
+  platform: string = process.platform
+): string[] | undefined {
+  if (!viaShell || platform !== "win32") return undefined;
+  if (!Number.isInteger(pid) || (pid as number) <= 0) return undefined;
+  return ["/pid", String(pid), "/t", "/f"];
+}
+
+/**
+ * How much *unterminated* stdout to hold on to.
+ *
+ * A line is only dispatched once its newline arrives, so anything without one
+ * accumulates with no bound. A real ACP message is nowhere near this size;
+ * something emitting megabytes of it is malfunctioning, and holding the lot
+ * turns that malfunction into a memory problem as well. Checked after the line
+ * loop has run, so a large write full of *complete* messages is never dropped —
+ * only a trailing fragment that has grown implausible.
+ */
+const MAX_PENDING_STDOUT = 1024 * 1024;
+
 interface Pending {
   resolve: (value: any) => void;
   reject: (reason: Error) => void;
@@ -44,6 +79,8 @@ export class AcpClient {
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private stopped = false;
+  /** Whether the running child is a shell wrapping the real agent. */
+  private viaShell = false;
 
   constructor(private readonly options: AcpClientOptions) {}
 
@@ -67,6 +104,7 @@ export class AcpClient {
     // Build one quoted command line for the shell case. Node warns when args
     // are passed alongside shell: true, because it does not escape them.
     const viaShell = needsShell(command);
+    this.viaShell = viaShell;
     const proc = spawn(
       viaShell ? [command, ...args].map(quote).join(" ") : command,
       viaShell ? [] : args,
@@ -107,10 +145,27 @@ export class AcpClient {
   stop(): void {
     this.stopped = true;
     this.failAllPending(new Error("The Kiro agent was stopped."));
-    if (this.proc) {
-      this.proc.stdin?.end();
-      this.proc.kill();
-      this.proc = undefined;
+    const proc = this.proc;
+    if (!proc) return;
+    this.proc = undefined;
+    proc.stdin?.end();
+
+    const args = killArgs(proc.pid, this.viaShell);
+    if (!args) {
+      proc.kill();
+      return;
+    }
+    // taskkill /t takes the shell and everything underneath it, which is the
+    // only way to reach the agent when a .cmd shim is in between.
+    try {
+      const killer = spawn("taskkill", args, { windowsHide: true, stdio: "ignore" });
+      killer.on("error", (err) => {
+        this.options.onLog(`taskkill failed (${err.message}); killing the shell instead.`);
+        proc.kill();
+      });
+    } catch (err) {
+      this.options.onLog(`taskkill could not be started: ${String(err)}`);
+      proc.kill();
     }
   }
 
@@ -192,6 +247,15 @@ export class AcpClient {
           }`
         );
       }
+    }
+
+    // Whatever is left has no newline in it, so it can never be dispatched on
+    // its own. Past the cap it is not a message being assembled any more.
+    if (this.stdoutBuffer.length > MAX_PENDING_STDOUT) {
+      this.options.onLog(
+        `Discarded ${this.stdoutBuffer.length} bytes of unterminated output from Kiro.`
+      );
+      this.stdoutBuffer = "";
     }
   }
 

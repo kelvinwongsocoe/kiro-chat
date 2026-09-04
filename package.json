@@ -2,7 +2,7 @@
   "name": "kiro-chat",
   "displayName": "Kiro Chat",
   "description": "Chat with the Kiro agent inside VS Code, like Copilot Chat.",
-  "version": "0.22.2",
+  "version": "0.25.1",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -89,10 +89,6 @@
         "command": "kiroChat.showHistory",
         "title": "Kiro Chat: Past Chats",
         "icon": "$(history)"
-      },
-      {
-        "command": "kiroChat.askInChat",
-        "title": "Kiro Chat: Ask in VS Code Chat (drag files here)"
       }
     ],
     "menus": {
@@ -164,7 +160,7 @@
         "kiroChat.allowFileWrites": {
           "type": "boolean",
           "default": true,
-          "description": "Let Kiro write files in your workspace. Turn this off to make the chat read-only."
+          "markdownDescription": "Let Kiro keep the files it edits. Turning this off does **not** stop the write: Kiro CLI performs its own edits, so the extension snapshots each file before the turn and restores it at the end. The file changes on disk briefly in between, where a file watcher or build could see it."
         },
         "kiroChat.args": {
           "type": "array",
@@ -213,16 +209,7 @@
           "description": "Send the code you have highlighted along with your message. The chip above the text box shows what is going; clear the highlight in the editor to leave it out."
         }
       }
-    },
-    "chatParticipants": [
-      {
-        "id": "kiroChat.participant",
-        "name": "kiro",
-        "fullName": "Kiro",
-        "description": "Ask Kiro about your code",
-        "isSticky": true
-      }
-    ]
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",

@@ -58,6 +58,23 @@ A feature almost always means editing both:
 
 `KiroSession.handleRequest` answers `fs/read_text_file`, `fs/write_text_file` and `session/request_permission`. **Every file path goes through `resolveInsideWorkspace`**, which accepts every root in a multi-root workspace and rejects anything outside all open folders. That function is the security boundary — don't route file access around it. Writes additionally check `kiroChat.allowFileWrites`.
 
+**Containment is tested on real paths, not written ones.** `resolveInsideWorkspace` defers
+to `isInsideAnyRoot` in `workspacePaths.ts` (free of `vscode`, so `test/workspaceBoundary.test.js`
+drives it against real junctions). Comparing the resolved string defeats `../`, but a symlink
+or a Windows junction *inside* the workspace pointing out of it resolves to an in-workspace
+string and used to be accepted — which is not what the README promises. Both sides are put
+through `realPathOf`, which handles a file that does not exist yet by resolving the nearest
+existing ancestor and rejoining the rest; resolving only the child would make every file
+under a symlinked workspace root look external. The path handed back is still the one that
+was asked for, so a link keeps working as a link once it has been shown to lead somewhere
+allowed.
+
+**`allowFileWrites: false` and Plan mode revert; they do not prevent.** Kiro CLI 2.21 makes
+its own edits, so there is no call to refuse — the file really is written and then restored
+from its pre-turn snapshot. Anything watching the filesystem sees the intermediate state.
+Say so plainly in any wording about read-only; the setting's description used to promise
+prevention.
+
 With `kiroChat.reviewFileWrites` enabled, `ChangeReviewer` holds the write request open and
 opens a read-only virtual source document in the editor. Theme-aware decorations mark pending
 deletions red and insertions green. A CodeLens provider supplies whole-file
@@ -197,6 +214,30 @@ be offering to undo nothing. The snapshots for the files that really changed sur
 passes Kiro's option ids and labels through `SessionEvents.onPermission`; the provider
 posts an inline permission card and resolves the request when `chat.js` returns a
 `permissionDecision`. The VS Code notification is only a fallback when no panel exists.
+
+**Neither is `isWriteLikeTool`, and for the same reason.** It used to gate the pre-turn
+snapshot in `observeToolPaths` (called `observeDirectFileWrite` until 0.25.0, when it
+stopped being only about writes). A tool shape it did not recognise meant no baseline, so
+no review and no keep-or-undo card — the edit just appeared on disk. Every path any tool
+mentions is snapshotted now, and `finishDirectFileReviews` walks `toolTouchedPaths` and
+reviews whatever differs from its baseline; the heuristic only decides whether to
+*simulate* a result. `pathsMentionedBy` reads `locations`, `rawInput.path` and
+`rawInput.operations[].path`, because Kiro uses all three and only the middle one was
+being read.
+
+**A snapshot and a review are not the same entitlement.** Every mentioned path is
+snapshotted; only a path from a tool that *might* have written joins `toolTouchedPaths` and
+so earns a diff. `isReadOnlyTool` (`writeTools.ts`, beside its counterpart) returns false for
+anything it does not recognise — an unknown tool is assumed to have written, which is what
+keeps the paragraph above true. Only `read`/`search`/`grep`/`glob`/`list`/`fetch`/`think` opt
+out, and their changes still reach the keep-or-undo card. Without that split, a file Kiro
+merely read opened a diff whenever a watcher or formatter rewrote it mid-turn, and rejecting
+it would have clobbered a write Kiro never made.
+
+Baselines taken from prompt attachments are deliberately **not** in `toolTouchedPaths`. A
+file gets a snapshot either because a tool touched it or because the user attached it, and
+only the first means Kiro was working on it — reviewing the second would offer to undo the
+user's own mid-turn edit.
 
 **`DirectFileChange.expected` is a hint, never a gate.** It simulates what a tool input
 should produce, chained across every edit to a file in the turn. It used to have to match

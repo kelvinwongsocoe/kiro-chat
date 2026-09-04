@@ -145,3 +145,39 @@ test("a notification with nothing usable still names itself", () => {
   assert.equal(step.status, "running");
   assert.ok(step.id, "and it must still have an id, or rows would collide");
 });
+
+/*
+ * A step with no toolCallId must not multiply into a row per notification.
+ *
+ * The id fell back to Math.random(), so every update about one step arrived
+ * under a new identity: the panel appended a row instead of updating one, and a
+ * single noisy step could fill the list. It cannot be perfect — the three
+ * notifications for one step carry different titles on purpose — but repeats of
+ * the same phase have to collapse.
+ */
+test("a step with no id keeps the same id across repeated updates", () => {
+  const update = {
+    sessionUpdate: "tool_call_update",
+    kind: "read",
+    title: "Reading package.json:1",
+    status: "in_progress",
+  };
+
+  const first = describeTool(update);
+  const second = describeTool({ ...update, status: "completed" });
+
+  assert.equal(first.id, second.id, "the same step must not gain a new id per update");
+  assert.ok(first.id, "and it still needs some id to be addressed by");
+});
+
+test("two different steps are still told apart", () => {
+  const reading = describeTool({ kind: "read", title: "Reading a.ts" });
+  const writing = describeTool({ kind: "edit", title: "Editing b.ts" });
+  assert.notEqual(reading.id, writing.id);
+});
+
+/** A real toolCallId always wins; it is the only thing that truly correlates. */
+test("Kiro's own toolCallId is preferred over anything derived", () => {
+  const step = describeTool({ toolCallId: "call-7", kind: "read", title: "Reading a.ts" });
+  assert.equal(step.id, "call-7");
+});

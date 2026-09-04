@@ -1,4 +1,5 @@
 import * as vscode from "vscode";
+import { randomBytes } from "node:crypto";
 import {
   formatUsageReport,
   KiroSession,
@@ -45,13 +46,15 @@ function freshId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * The page's CSP nonce.
+ *
+ * Being unpredictable is the entire job of this value, and Math.random() is
+ * not: it is seeded per process and its output is recoverable from a few
+ * samples. `randomBytes` costs nothing here — one call per webview.
+ */
 function nonce(): string {
-  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-  let out = "";
-  for (let i = 0; i < 32; i++) {
-    out += chars.charAt(Math.floor(Math.random() * chars.length));
-  }
-  return out;
+  return randomBytes(16).toString("base64");
 }
 
 export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disposable {
@@ -597,12 +600,6 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.pendingPermissions.clear();
   }
 
-  /** The live Kiro session, shared with the @kiro chat participant so both
-   *  boxes talk to one conversation rather than two agents. */
-  get kiroSession(): KiroSession {
-    return this.session;
-  }
-
   focus(): void {
     void vscode.commands.executeCommand(`${ChatViewProvider.viewId}.focus`);
   }
@@ -797,6 +794,22 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     const trimmed = text.trim();
     if (!trimmed && this.attachments.length === 0) return;
 
+    /*
+     * Refused before the bubble is posted, not after.
+     *
+     * The webview disables Send while a turn runs, but a command does not go
+     * through the webview at all — kiroChat.explainSelection lands here
+     * directly, as does anything else calling sendFromEditor. Checking here
+     * rather than letting KiroSession throw means a refused message leaves no
+     * orphan bubble in the transcript, and the user's text is still theirs.
+     */
+    if (this.session.currentStatus === "busy") {
+      vscode.window.showWarningMessage(
+        "Kiro is still working on the last message. Wait for it to finish."
+      );
+      return;
+    }
+
     this.selection = readSelection();
     // The file on screen goes along too, unless the user dismissed its chip.
     // A file already attached by hand wins, so nothing is sent twice.
@@ -834,7 +847,17 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     this.postAttachments();
 
     this.everConnected = true;
-    await this.session.send(blocks, { readOnly: mode.readOnly === true });
+    try {
+      await this.session.send(blocks, { readOnly: mode.readOnly === true });
+    } catch (err) {
+      // A turn reports its own failures through onError. The only thing that
+      // reaches here is one refused before it started — a race with the guard
+      // above — and the transcript is already showing a bubble for it, so the
+      // turn has to be ended rather than left spinning.
+      const message = err instanceof Error ? err.message : String(err);
+      this.post({ type: "error", text: message });
+      this.post({ type: "turnEnd", reason: "error" });
+    }
   }
 
   async sendFromEditor(text: string): Promise<void> {

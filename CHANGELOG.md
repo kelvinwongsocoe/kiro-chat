@@ -1,5 +1,132 @@
 # Changelog
 
+## 0.25.1
+
+- **A file Kiro only read no longer opens a review when something else changes it.** 0.25.0
+  reviewed any snapshotted file that differed by the end of the turn, which was the right
+  question for a file Kiro wrote and the wrong one for a file it merely read: a watcher, a
+  formatter or a dev server rewriting one mid-turn opened a diff, and rejecting that diff
+  would have clobbered a write Kiro never made.
+
+  The snapshot is still taken either way — it costs one read, and a later unrecognised write
+  to the same file needs a "before" that predates it. What a read no longer earns is the
+  diff. The change is still reported in the keep-or-undo card, which is the gentler surface
+  for "this changed, was that you?"; going quiet about it would be the original bug again.
+
+- **`isReadOnlyTool` answers false for anything it does not recognise**, and that asymmetry
+  is the whole design. An unknown tool is assumed to have written, so 0.25.0's fix for
+  unreviewed edits is untouched — only a kind that positively cannot write (`read`,
+  `search`, `grep`, `glob`, `list`, `fetch`, `think`) opts a file out. `execute`/`shell` are
+  deliberately absent: a command can write anything, and `terminal: false` is not a proof.
+
+## 0.25.0
+
+- **An edit made by a tool the extension did not recognise no longer lands unreviewed.**
+  `isWriteLikeTool` gated the pre-turn *snapshot*, not just the simulated result — so a tool
+  shape it did not know, or a path it could not find, meant no baseline, no diff, no
+  keep-or-undo card, and Kiro's edit simply appeared on disk with nothing said about it. An
+  unreviewed edit is the one outcome nobody wants, and a heuristic was the only thing
+  standing in its way.
+
+  The heuristic is a hint now, the same demotion `DirectFileChange.expected` already went
+  through. Every path any tool mentions gets a snapshot, whatever the tool is — reading a
+  file is the strongest available signal that an edit is coming — and the end-of-turn pass
+  reviews whatever actually differs from its snapshot. "Did this change?" needs no
+  heuristic to answer correctly.
+
+- **Paths are read from everywhere Kiro puts them.** Only `rawInput.path` was consulted.
+  The payload captured from a real turn carries the path in `locations` *and* in
+  `rawInput.operations[].path`, and in neither of the places the extractor looked — so the
+  `operations` form, which the built-in edit tools use, was missed every time.
+
+- **A file the user edits mid-turn is deliberately still not swept into a review.** A
+  baseline exists for two reasons: a tool mentioned the file, or the user attached it. Only
+  the first means Kiro was working on it, and only those are reviewed. A diff offering to
+  undo the user's own typing would be worse than the gap it closed.
+
+- Snapshots no longer throw. A directory, an unreadable path or something implausibly large
+  comes back as "no baseline" rather than an exception — which, now that far more files are
+  snapshotted, would otherwise have taken the whole keep-or-undo card down with it. Files
+  over 10MB are skipped and logged.
+
+## 0.24.0
+
+- **The `@kiro` chat participant is gone.** It was a second way into the same Kiro session,
+  aimed at VS Code's own chat box, and it was never documented in the README — so the only
+  people who found it were the ones who went looking. Its real draw was that a file could
+  be dragged onto the native chat box, which a webview can never accept: VS Code sets
+  `pointer-events: none` on every webview for the duration of any drag.
+
+  Attaching files is unaffected. The **+** button, **Kiro Chat: Add to Chat Context** in
+  the Explorer's right-click menu, and pasting an image all work as before, and none of
+  them depend on a drop landing. What goes is the ability to drag a file onto VS Code's
+  chat box and have Kiro answer there.
+
+  Removed with it: the `kiroChat.askInChat` command, `src/participant.ts`,
+  `src/references.ts`, and the `TurnSink` plumbing in `KiroSession` — `sendTo`, the `sink`
+  field, and the branch in every notification handler that asked whether the panel or the
+  participant was the audience.
+
+- **Two of 0.23.0's fixes are now moot, which is the better outcome.** The concurrency
+  guard and the `turn_end` routing existed because one session had two front doors that
+  were not aware of each other. With one door there is no such race to guard against. The
+  busy check survives in a simpler form, because **Kiro Chat: Explain Selection** still
+  reaches `send` without passing the webview's disabled Send button.
+
+## 0.23.0
+
+- **Asking a second question mid-turn no longer answers it into the wrong window.**
+  `sendTo` guarded against a second turn on the session; `send` did not, and it is
+  reachable without passing the panel's disabled Send button — **Kiro Chat: Explain
+  Selection** goes straight to it. Right-clicking code while `@kiro` was answering in VS
+  Code's own chat box put a second `session/prompt` on one session, and because the
+  participant still owned the output, the panel's reply was streamed into *its* response
+  instead. Both entry points now share one guard, which runs before the sink is claimed.
+  A refused message is turned away before its bubble is posted, so the text stays in the
+  box rather than vanishing into a transcript.
+- **`turn_end` is routed the same way as everything else.** An `@kiro` turn finishing used
+  to post a turn-ended message into the panel, which was not running it.
+- **A long `@kiro` answer is no longer cut off after two minutes.** The idle timeout was
+  armed once and never re-armed, making it a hard cap on the whole turn rather than a
+  check for Kiro going quiet — so a multi-file edit was cancelled mid-sentence with
+  nothing said about why. Every chunk of text and every tool step now pushes it back.
+  Real silence still ends the turn.
+- **Restarting the agent no longer leaves Kiro running.** When the CLI is a `.cmd` shim it
+  runs through the shell, so the process being killed was `cmd.exe` and `kiro-cli` was its
+  grandchild — it survived, still holding its session. Windows has no process group to
+  signal, so the whole tree goes through `taskkill` now.
+- **The review tab is closed wherever it is.** Pressing **Keep** on the chat bar while
+  looking at another file left the `(Working Tree)` tab open and deleted the content behind
+  it, so a stale, empty tab stayed until it was closed by hand. The chat bar exists so the
+  diff does not have to be in front of you, which made this the ordinary path rather than
+  an edge case.
+- **The workspace boundary now checks where a path really leads.** It compared paths as
+  written, which stops `../` but says nothing about a symlink or a junction *inside* the
+  folder pointing out of it: that resolved to an in-workspace string and was allowed. Both
+  sides are resolved before the containment test, with a file that does not exist yet
+  handled through its nearest existing parent so creating one still works. A link that
+  stays inside the workspace is unaffected.
+- **Auto-approval takes the narrowest permission on offer.** Kiro sends `allow_once` and
+  `allow_always` side by side and the first one won, so `kiroChat.autoApproveTools` could
+  hand out a standing grant where a single-use one was available.
+- The page's CSP nonce is generated with `crypto.randomBytes` rather than `Math.random`,
+  which is seeded per process and recoverable from a few samples.
+- Unterminated output from Kiro is capped instead of accumulating without limit. The check
+  runs after complete messages have been dispatched, so a large write of real messages is
+  never discarded.
+- A tool step that arrives without a `toolCallId` keeps one id across its updates instead
+  of taking a random one each time, which used to add a row to the steps list per
+  notification.
+- **The README said several things the code does not do.** Closing a review tab keeps the
+  hunks you already accepted rather than rejecting everything; the CodeLens actions are
+  **Accept** / **Reject** and not numbered "change N of M"; the sign-in command is
+  `kiro-cli login`; images and past chats were still listed as unbuilt in a file with
+  sections describing both. `kiroChat.attachActiveFile` was missing from the settings table.
+- **`allowFileWrites` and Plan mode are described honestly.** Neither prevents a write:
+  Kiro CLI makes its own edits, so the file is written and then restored from its pre-turn
+  snapshot. That is invisible in the editor but not to a file watcher, a dev server or a
+  build, and the setting used to promise a read-only chat.
+
 ## 0.22.2
 
 - **A run of backticks inside a sentence no longer swallows the rest of the reply.** A

@@ -119,29 +119,33 @@ test("every contributed command is registered when all is well", () => {
       `${command} was never registered`
     );
   }
-  assert.deepEqual(api.__registered.participants, ["kiroChat.participant"]);
 });
 
-/** The participant is a manifest contribution too, and can be rejected. */
-test("a chat participant that will not register takes nothing else down", () => {
-  const api = fakeVscode({ participantThrows: true });
+/**
+ * The `@kiro` chat participant was removed in 0.24.0. It was a second way into
+ * the same session, aimed at VS Code's own chat box, and its only real draw was
+ * that a file could be dragged onto that box. Nothing should register one now —
+ * a stray registration would put an undocumented second entry point back.
+ */
+test("no chat participant is registered any more", () => {
+  const api = fakeVscode();
   activateWith(api);
+  assert.deepEqual(api.__registered.participants, []);
 
-  for (const command of contributed()) {
-    assert.ok(
-      api.__registered.commands.includes(command),
-      `${command} was lost because the participant failed`
-    );
-  }
-  assert.ok(api.__registered.views.includes("kiroChat.view"), "the panel must survive");
+  const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+  assert.equal(
+    pkg.contributes.chatParticipants,
+    undefined,
+    "the manifest should not contribute one either"
+  );
 });
 
-/** Both failing at once must still leave a working extension. */
-test("everything optional failing still leaves the panel and commands", () => {
-  const api = fakeVscode({ participantThrows: true, treeViewThrows: true });
+/** Optional contributions failing must still leave a working extension. */
+test("a view that will not register takes nothing else down", () => {
+  const api = fakeVscode({ treeViewThrows: true });
   activateWith(api);
   for (const command of contributed()) {
     assert.ok(api.__registered.commands.includes(command), `${command} was lost`);
   }
-  assert.ok(api.__registered.views.includes("kiroChat.view"));
+  assert.ok(api.__registered.views.includes("kiroChat.view"), "the panel must survive");
 });

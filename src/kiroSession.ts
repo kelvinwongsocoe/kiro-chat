@@ -5,9 +5,10 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import { AcpClient } from "./acpClient";
 import { ActiveReviewInfo, ChangeReviewer } from "./changeReviewer";
-import { isWriteLikeTool } from "./writeTools";
+import { isReadOnlyTool, isWriteLikeTool } from "./writeTools";
 import { changedSinceBaseline, describeChange, TurnChange } from "./turnChanges";
 import { findKiro } from "./findKiro";
+import { isInsideAnyRoot, isInsideRoot } from "./workspacePaths";
 import { looksLikeSignIn } from "./startupError";
 import {
   creditRateOf,
@@ -48,13 +49,6 @@ export type ContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string }
   | { type: "resource_link"; uri: string; name: string; mimeType?: string };
-
-/** Somewhere other than the panel for one turn's output to go. */
-export interface TurnSink {
-  onText: (text: string) => void;
-  onThought?: (text: string) => void;
-  onTool?: (tool: ToolStep) => void;
-}
 
 export interface SendOptions {
   /** Refuse and restore all writes made during this turn. */
@@ -161,8 +155,23 @@ export function describeTool(update: any): ToolStep {
       : raw || "Working";
 
   const purpose = String(update?.rawInput?.__tool_use_purpose ?? "").trim();
+  /*
+   * A stable id when Kiro sends none.
+   *
+   * This used to fall back to Math.random(), which gave every notification
+   * about one step a different id — so instead of a row updating in place, the
+   * panel grew a fresh row for each update and a single step could fill the
+   * list. Deriving it from what the step *is* collapses the repeats.
+   *
+   * It cannot do better than that: the three notifications for one step carry
+   * different titles by design (see the comment above), so without a
+   * toolCallId there is nothing that ties them together. This is strictly
+   * fewer duplicate rows, not none.
+   */
+  const id =
+    String(update?.toolCallId ?? update?.id ?? "").trim() || `${kind || "tool"}:${raw}`;
   return {
-    id: String(update?.toolCallId ?? update?.id ?? Math.random()),
+    id,
     title,
     // Only `tool_call_update` carries a status; the earlier two are underway.
     status: String(update?.status ?? "running"),
@@ -189,6 +198,16 @@ export function isSessionUpdate(method: string): boolean {
   return bare === "session/update" || bare === "session/notification";
 }
 
+/**
+ * How large a file to hold a pre-turn copy of.
+ *
+ * Baselines are taken for every file a tool mentions now, not only the ones
+ * being written, so a turn that reads widely holds far more than it used to.
+ * Source files are nowhere near this, and something that is would not make a
+ * readable diff anyway.
+ */
+const MAX_BASELINE_BYTES = 10 * 1024 * 1024;
+
 function normaliseKind(kind: unknown): string {
   return String(kind ?? "")
     .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
@@ -208,17 +227,19 @@ export class KiroSession {
   /** True while session/load runs, so a replay does not double-paint. */
   private replaying = false;
   private textSpy: ((text: string) => void) | undefined;
-  /**
-   * Where this turn's output goes, when it is not the panel. VS Code's own
-   * chat box asks through `sendTo`, and its answer belongs in its response
-   * stream rather than in the webview's transcript.
-   */
-  private sink: TurnSink | undefined;
   private readonly changeReviewer: ChangeReviewer;
   /** Baselines are captured before Kiro's built-in tools can touch disk. */
   private readonly turnBaselines = new Map<string, FileSnapshot>();
   private readonly directFileChanges = new Map<string, DirectFileChange>();
   private readonly observedWriteTools = new Set<string>();
+  /**
+   * Every workspace path any tool mentioned this turn, write-like or not.
+   *
+   * This is what the end-of-turn review walks. A path only reaches it through
+   * a tool call, so a file the *user* edited while the turn ran is not swept
+   * into a diff offering to undo their own work.
+   */
+  private readonly toolTouchedPaths = new Set<string>();
   /** A write routed through the ACP fs callback must not be reviewed twice. */
   private readonly clientReviewedPaths = new Set<string>();
   /**
@@ -323,14 +344,10 @@ export class KiroSession {
     return roots.length > 0 ? roots : [os.homedir()];
   }
 
+  // One definition of containment, shared with the boundary check below, so
+  // the two cannot drift into disagreeing about what "inside" means.
   private isInside(root: string, full: string): boolean {
-    const relative = path.relative(root, full);
-    return (
-      relative === "" ||
-      (relative !== ".." &&
-        !relative.startsWith(`..${path.sep}`) &&
-        !path.isAbsolute(relative))
-    );
+    return isInsideRoot(root, full);
   }
 
   private displayPath(full: string): string {
@@ -442,27 +459,20 @@ export class KiroSession {
   }
 
   /**
-   * Ask Kiro something on behalf of VS Code's own chat box, streaming the
-   * answer into the caller's sink instead of the panel's transcript.
+   * Ask Kiro something. One conversation means one turn at a time.
    *
-   * The two share one Kiro session deliberately: the conversation is the same
-   * conversation whichever box it was typed into, so credits, context and
-   * memory all stay in one place rather than running a second agent.
+   * The busy check matters because this is reachable without passing the
+   * webview's disabled Send button: `kiroChat.explainSelection` calls it
+   * through the provider, so a right-click mid-turn would otherwise put a
+   * second `session/prompt` on one session.
    */
-  async sendTo(blocks: ContentBlock[], sink: TurnSink): Promise<void> {
-    if (this.sink) throw new Error("Kiro is already answering another question.");
-    if (this.status === "busy") {
+  async send(blocks: ContentBlock[], options: SendOptions = {}): Promise<void> {
+    // Read through the getter, as `runCommand` does: checking `this.status`
+    // here narrows it for the rest of the method, and the `finally` below
+    // legitimately expects it to be "busy" by then.
+    if (this.currentStatus === "busy") {
       throw new Error("Kiro is still working on the last message. Wait for it to finish.");
     }
-    this.sink = sink;
-    try {
-      await this.send(blocks);
-    } finally {
-      this.sink = undefined;
-    }
-  }
-
-  async send(blocks: ContentBlock[], options: SendOptions = {}): Promise<void> {
     await this.ensureReady();
     if (!this.client || !this.sessionId) return;
 
@@ -475,7 +485,16 @@ export class KiroSession {
     this.beginTurnFileCapture(usable);
     this.setStatus("busy");
     try {
-      // Kiro's docs call this field `content`; the ACP spec calls it `prompt`.
+      /*
+       * Kiro's docs call this field `content`; the ACP spec calls it `prompt`.
+       *
+       * Deliberately sent with no timeout, unlike every other call that can
+       * silently never answer. A turn is different in kind: an agentic run
+       * editing several files legitimately takes as long as it takes, and any
+       * threshold worth setting would eventually cut a real one short. Stop is
+       * already there for a turn that has genuinely wedged, and that is the
+       * user's judgement rather than a guess made here.
+       */
       const result = await this.client.request("session/prompt", {
         sessionId: this.sessionId,
         prompt: usable,
@@ -483,16 +502,12 @@ export class KiroSession {
       });
       await this.finishDirectFileReviews();
       this.reportTurnChanges();
-      // A sink means someone else asked and is showing the answer; the panel
-      // must not also declare the turn over, and the error belongs to the
-      // caller rather than to the transcript.
-      if (!this.sink) this.events.onTurnEnd(result?.stopReason);
+      this.events.onTurnEnd(result?.stopReason);
     } catch (err) {
       // An edit can succeed before a later tool fails. It still needs to be
       // restored and reviewed instead of being left behind silently.
       await this.finishDirectFileReviews();
       this.reportTurnChanges();
-      if (this.sink) throw err;
       this.events.onError(err instanceof Error ? err.message : String(err));
       this.events.onTurnEnd("error");
     } finally {
@@ -712,17 +727,13 @@ export class KiroSession {
     switch (kind) {
       case "agent_message_chunk": {
         const text = contentToText(update.content);
-        // A command is collecting, a chat participant is streaming, or the
-        // panel is the audience — in that order of precedence.
+        // A command is collecting, or the panel is the audience.
         if (this.textSpy) this.textSpy(text);
-        else if (this.sink) this.sink.onText(text);
         else this.events.onText(text);
         break;
       }
       case "agent_thought_chunk": {
-        const thought = contentToText(update.content);
-        if (this.sink) this.sink.onThought?.(thought);
-        else this.events.onThought(thought);
+        this.events.onThought(contentToText(update.content));
         break;
       }
       // `tool_call_chunk` is the first word that a step is starting, and it
@@ -731,13 +742,12 @@ export class KiroSession {
       case "tool_call_chunk":
       case "tool_call":
       case "tool_call_update": {
-        this.observeDirectFileWrite(update);
+        this.observeToolPaths(update);
         const tool = describeTool(update);
         this.output.appendLine(
           `[tool] ${tool.status} ${tool.title}${tool.purpose ? ` — ${tool.purpose}` : ""}`
         );
-        if (this.sink) this.sink.onTool?.(tool);
-        else this.events.onTool(tool);
+        this.events.onTool(tool);
         break;
       }
       case "turn_end":
@@ -770,12 +780,36 @@ export class KiroSession {
     }
   }
 
+  /**
+   * The security boundary. Every path Kiro asks for goes through here — do not
+   * route file access around it.
+   *
+   * Containment is tested against the *real* locations, not the paths as
+   * written. Resolving the string defeats `../`, but it says nothing about a
+   * symlink or a Windows junction inside the workspace pointing out of it:
+   * that resolves to an in-workspace string and used to be accepted, which is
+   * not what the README promises. `realPathOf` handles a file that does not
+   * exist yet by resolving the nearest existing ancestor.
+   *
+   * The path handed back is still the one that was asked for, not its resolved
+   * form, so a link inside the workspace keeps working as a link once it has
+   * been shown to lead somewhere allowed.
+   */
   private resolveInsideWorkspace(target: string): string {
     const full = path.resolve(this.workspaceRoot(), target);
-    if (this.workspaceRoots().some((root) => this.isInside(root, full))) return full;
+    if (isInsideAnyRoot(this.workspaceRoots(), full)) return full;
     throw new Error(`Path is outside the open folders: ${target}`);
   }
 
+  /*
+   * Deliberately no size cap on what this will read.
+   *
+   * A large file is a memory spike at both ends, but a file Kiro asks for is
+   * one it needs to answer the question it was given, and refusing at some
+   * arbitrary threshold would fail the turn for a reason the user cannot see or
+   * act on. Kiro already asks for `line`/`limit` when it only wants part of a
+   * file, which is the mechanism that actually keeps these reads small.
+   */
   private async readFile(params: any): Promise<string> {
     const full = this.resolveInsideWorkspace(String(params?.path ?? ""));
     const text = await fs.readFile(full, "utf8");
@@ -971,6 +1005,7 @@ export class KiroSession {
   private beginTurnFileCapture(blocks: ContentBlock[]): void {
     this.turnBaselines.clear();
     this.directFileChanges.clear();
+    this.toolTouchedPaths.clear();
     this.observedWriteTools.clear();
     this.clientReviewedPaths.clear();
     this.answeredPaths.clear();
@@ -995,55 +1030,151 @@ export class KiroSession {
     return process.platform === "win32" ? normal.toLowerCase() : normal;
   }
 
-  private snapshotSync(full: string): FileSnapshot {
+  /**
+   * A pre-turn copy of one file, or undefined when there is nothing usable.
+   *
+   * Anything that is not simply a missing file — an unreadable path, a
+   * directory, something implausibly large — comes back undefined rather than
+   * throwing. A baseline that could not be taken is not the same as a file
+   * that does not exist, and recording it as the latter would put a wrong
+   * entry in the undo set. Throwing was worse still: baselines are now taken
+   * for every file a tool mentions, so one unreadable path would have taken
+   * `reportTurnChanges` down with it and lost the whole keep-or-undo card.
+   */
+  private snapshotSync(full: string): FileSnapshot | undefined {
     try {
+      const stat = fsSync.statSync(full);
+      if (!stat.isFile()) return undefined;
+      if (stat.size > MAX_BASELINE_BYTES) {
+        this.output.appendLine(
+          `Not snapshotting ${this.displayPath(full)}: ${stat.size} bytes is past the limit.`
+        );
+        return undefined;
+      }
       return { full, exists: true, content: fsSync.readFileSync(full, "utf8") };
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
         return { full, exists: false, content: "" };
       }
-      throw err;
+      this.output.appendLine(
+        `Could not snapshot ${this.displayPath(full)}: ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+      return undefined;
     }
   }
 
-  private captureBaseline(full: string): FileSnapshot {
+  private captureBaseline(full: string): FileSnapshot | undefined {
     const key = this.pathKey(full);
     const saved = this.turnBaselines.get(key);
     if (saved) return saved;
     const snapshot = this.snapshotSync(full);
-    this.turnBaselines.set(key, snapshot);
+    if (snapshot) this.turnBaselines.set(key, snapshot);
     return snapshot;
   }
 
-  /** Record the path and expected content from a built-in edit tool update. */
-  private observeDirectFileWrite(update: any): void {
+  /**
+   * Every workspace path a tool update mentions, however it names them.
+   *
+   * Kiro puts a path in more places than one, and reading only `rawInput.path`
+   * missed most of them. The payload captured in `test/toolSteps.test.js` for
+   * a single read carries the path twice — once in `locations`, once in
+   * `rawInput.operations[].path` — and in neither of the places this used to
+   * look. A path that is never found is a file that is never snapshotted, and
+   * therefore never reviewed.
+   */
+  private pathsMentionedBy(update: any): string[] {
+    const raw = update?.rawInput ?? update?.input ?? update?.toolCall?.rawInput;
+    const locations = (value: any) =>
+      Array.isArray(value) ? value.map((entry: any) => entry?.path) : [];
+
+    const candidates: unknown[] = [
+      raw?.path,
+      raw?.filePath,
+      raw?.file_path,
+      ...locations(update?.locations),
+      ...locations(update?.toolCall?.locations),
+      ...locations(raw?.operations),
+    ];
+
+    const out: string[] = [];
+    for (const value of candidates) {
+      if (typeof value !== "string" || !value) continue;
+      try {
+        const full = this.resolveInsideWorkspace(value);
+        if (!out.includes(full)) out.push(full);
+      } catch {
+        // Outside the open folders, so never writable through this extension
+        // and not part of the turn's change set.
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Watch a tool update for the files it is about.
+   *
+   * Two jobs, and they used to be one:
+   *
+   * - **Every** path any tool mentions gets a pre-turn snapshot, whatever the
+   *   tool is. Reading a file is the strongest available hint that an edit is
+   *   coming, and a snapshot is worth nothing unless it was taken first.
+   * - A tool that *looks* like a write additionally gets its result simulated,
+   *   so `finishDirectFileReviews` has something to compare against.
+   *
+   * `isWriteLikeTool` used to gate both, which made it the only thing standing
+   * between an edit and going unreviewed: a tool shape it did not recognise —
+   * or a path it could not find, which for the `operations` form was every
+   * time — meant no snapshot, no diff, and no keep-or-undo card. The edit
+   * simply appeared on disk. It is a hint now, the same demotion
+   * `DirectFileChange.expected` already went through, and for the same reason:
+   * an unreviewed edit is the one outcome nobody wants.
+   */
+  private observeToolPaths(update: any): void {
+    /*
+     * Snapshot everything; only offer a diff for what might have been written.
+     *
+     * The snapshot is taken either way — it costs a read, and a later
+     * unrecognised write to the same file needs a "before" that predates it.
+     * What a read does not earn is a *review*. 0.25.0 reviewed any snapshotted
+     * file that differed at the end of the turn, which meant a file Kiro merely
+     * read could open a diff when something outside Kiro — a watcher, a
+     * formatter, a dev server — rewrote it mid-turn, and rejecting that diff
+     * would clobber a write Kiro never made.
+     *
+     * `isReadOnlyTool` answers false for anything it does not recognise, so an
+     * unknown tool still earns a review. Only a kind that positively cannot
+     * write opts out, and the change still reaches the keep-or-undo card,
+     * which is the gentler surface for "this changed, was that you?".
+     */
+    const reviewable = !isReadOnlyTool(update);
+    for (const full of this.pathsMentionedBy(update)) {
+      if (!this.captureBaseline(full)) continue;
+      if (reviewable) this.toolTouchedPaths.add(this.pathKey(full));
+    }
+
     // Shared with askPermission, which uses the same answer to decide that an
     // edit does not need a prompt of its own. Two copies of this heuristic
     // would eventually disagree, and the symptom would be a stray prompt.
     if (!isWriteLikeTool(update)) return;
 
     const raw = update?.rawInput ?? update?.input ?? update?.toolCall?.rawInput;
-
     const target = raw?.path ?? raw?.filePath ?? raw?.file_path;
-    if (typeof target !== "string" || !target) return;
-
-    let full: string;
-    try {
-      full = this.resolveInsideWorkspace(target);
-    } catch (err) {
-      this.output.appendLine(
-        `Ignored a write tool outside the workspace: ${
-          err instanceof Error ? err.message : String(err)
-        }`
-      );
-      return;
-    }
+    // The named target when there is one, otherwise whatever the update
+    // mentioned first — a write that only reports `locations` still has a file.
+    const full =
+      typeof target === "string" && target
+        ? this.pathsMentionedBy({ rawInput: { path: target } })[0]
+        : this.pathsMentionedBy(update)[0];
+    if (!full) return;
 
     const toolId = String(update?.toolCallId ?? update?.id ?? "");
     if (toolId && this.observedWriteTools.has(toolId)) return;
 
     const key = this.pathKey(full);
     const before = this.captureBaseline(full);
+    if (!before) return;
     const tracked = this.directFileChanges.get(key) ?? { before };
     const base = tracked.expected ?? before.content;
     const expected = this.expectedToolResult(base, raw);
@@ -1076,9 +1207,32 @@ export class KiroSession {
    * versions through the same selectable reviewer as an ACP callback write.
    */
   private async finishDirectFileReviews(): Promise<void> {
-    if (this.directFileChanges.size === 0) return;
-    const changes = [...this.directFileChanges.entries()];
+    /*
+     * Everything a tool touched, not only what looked like a write.
+     *
+     * This used to walk `directFileChanges` alone, so the review a file got
+     * depended entirely on `isWriteLikeTool` having recognised the tool that
+     * wrote it. Walking every snapshotted path a tool mentioned and comparing
+     * it against disk asks a better question — "did this actually change?" —
+     * which needs no heuristic to be right. `directFileChanges` now only
+     * supplies the simulated result, and that was always just a hint.
+     *
+     * Baselines from attached files are deliberately not included: they were
+     * snapshotted because the user attached them, not because Kiro touched
+     * them, and a file the *user* edited mid-turn must not be handed back as a
+     * diff offering to undo their own work.
+     */
+    const candidates = new Map<string, DirectFileChange>();
+    for (const key of this.toolTouchedPaths) {
+      const before = this.turnBaselines.get(key);
+      if (before) candidates.set(key, { before });
+    }
+    for (const [key, tracked] of this.directFileChanges) candidates.set(key, tracked);
+
     this.directFileChanges.clear();
+    this.toolTouchedPaths.clear();
+    if (candidates.size === 0) return;
+    const changes = [...candidates.entries()];
 
     const config = vscode.workspace.getConfiguration("kiroChat");
     const writesEnabled = config.get<boolean>("allowFileWrites", true);
@@ -1283,8 +1437,23 @@ export class KiroSession {
 
     if (options.length === 0) return { outcome: { outcome: "cancelled" } };
 
-    const allowOption = () =>
-      options.find((o) => String(o.kind ?? "").startsWith("allow")) ?? options[0];
+    /*
+     * Prefer the narrowest grant Kiro offered.
+     *
+     * ACP sends allow_once and allow_always side by side, and taking whichever
+     * arrived first meant an auto-approval could hand out a standing
+     * permission when a single-use one was on the table. Nothing here should
+     * grant more than the moment needs.
+     */
+    const allowOption = () => {
+      const kindOf = (option: any) =>
+        String(option?.kind ?? "").replace(/[-\s]/g, "_").toLowerCase();
+      return (
+        options.find((option) => kindOf(option) === "allow_once") ??
+        options.find((option) => kindOf(option).startsWith("allow")) ??
+        options[0]
+      );
+    };
 
     if (autoApprove) {
       const allow = allowOption();

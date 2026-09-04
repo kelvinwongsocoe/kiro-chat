@@ -98,11 +98,56 @@ test("there is one definition of a write-like tool, not two", () => {
   assert.match(
     session,
     /if \(!isWriteLikeTool\(update\)\) return;/,
-    "observeDirectFileWrite should use the shared detector"
+    "observeToolPaths should use the shared detector"
   );
   assert.doesNotMatch(
     session,
     /const writeLike =/,
     "the old inline copy of the heuristic should be gone"
   );
+});
+
+// ---- the other half: what positively cannot have written -----------
+//
+// Snapshots are taken for every file a tool mentions, but only a file that
+// might have been *written* earns a review diff. The default answer here is
+// false on purpose: an unknown tool is assumed to have written, which is what
+// keeps an unrecognised edit reviewable.
+
+const { isReadOnlyTool } = require("../out/writeTools");
+
+test("the kinds that cannot change a file are recognised", () => {
+  for (const kind of ["read", "search", "grep", "glob", "list", "fetch", "think"]) {
+    assert.equal(isReadOnlyTool({ kind }), true, `${kind} cannot write`);
+  }
+});
+
+test("an unknown tool is assumed to have written", () => {
+  assert.equal(isReadOnlyTool({ kind: "something_new" }), false);
+  assert.equal(isReadOnlyTool({ kind: "" }), false);
+  assert.equal(isReadOnlyTool({}), false);
+  assert.equal(isReadOnlyTool(undefined), false);
+});
+
+/** A command can write anything, and terminal access being off is not a proof. */
+test("running a command is never treated as read-only", () => {
+  for (const kind of ["execute", "shell", "bash"]) {
+    assert.equal(isReadOnlyTool({ kind }), false, `${kind} could write`);
+  }
+});
+
+/** The two answers must never both be true for one update. */
+test("a write-like tool is never also read-only", () => {
+  const writes = [
+    { kind: "edit" },
+    { kind: "write" },
+    { title: "Editing src/app.ts" },
+    { rawInput: { command: "strReplace" } },
+    // A kind on the read-only list, but the input says it replaces text.
+    { kind: "read", rawInput: { command: "strReplace" } },
+  ];
+  for (const update of writes) {
+    assert.equal(isWriteLikeTool(update), true, JSON.stringify(update));
+    assert.equal(isReadOnlyTool(update), false, JSON.stringify(update));
+  }
 });

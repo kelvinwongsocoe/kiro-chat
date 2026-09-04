@@ -171,7 +171,8 @@ what was tried.
 
 The two usual causes:
 
-- **Not signed in.** Run `kiro-cli auth login` in a terminal.
+- **Not signed in.** Run `kiro-cli login` in a terminal. This is the same command the
+  setup screen's **Sign in** button types for you.
 - **No folder open in VS Code.** Kiro needs a folder to work in.
 
 If the log says it couldn't find `kiro-cli`, run `which kiro-cli` in a terminal and paste
@@ -211,19 +212,25 @@ login you already have.
 ## Safety choices worth knowing
 
 - **Reading and writing files is limited to your open workspace folders.** This includes
-  every root in a multi-root workspace; a path outside all of them gets refused.
+  every root in a multi-root workspace; a path outside all of them gets refused. The check
+  is made against where a path really leads, so a symlink or a junction inside the folder
+  that points out of it is refused too.
 - **Tools ask first inside the chat.** Kiro's permission choices appear as an inline card
   in the current response instead of a separate popup. There is a setting to auto-approve,
   off by default. Only turn it on in a folder you trust.
 - **File changes open for inline review before the turn finishes.** Deleted/original lines
   are red and inserted/proposed lines are green in a source editor tab. Each changed section
-  has a blue **Review change N of M** marker plus numbered
-  **Accept change N of M / Reject change N of M** CodeLens actions; use `Alt+Enter` or
-  `Shift+Alt+Enter` with the cursor on a hunk. Whole-file actions remain at the top.
-  Accepted hunks are written immediately while rejected hunks collapse back to the original.
-  Kiro CLI's built-in edit tool writes directly, so the extension captures its
+  gets its own **Accept** and **Reject** actions above it; **Accept all**, **Reject all**,
+  **Next change** and **Previous change** sit at the top of the file. Or use `Alt+Enter` and
+  `Shift+Alt+Enter` with the cursor on a hunk, and `Alt+F5` / `Shift+Alt+F5` to walk between
+  them. Accepted hunks are written immediately while rejected hunks collapse back to the
+  original. Kiro CLI's built-in edit tool writes directly, so the extension captures its
   result, restores the pre-turn file when the turn ends, and leaves only the lines you approve.
-  Closing the tab rejects the write. This is on by default and can be disabled in settings.
+  **Closing the tab keeps the hunks you already accepted** and rejects only the ones you
+  never answered — an accepted hunk was written the moment you clicked it, and putting the
+  old file back over the top would undo work you had agreed to. Cancelling the turn is the
+  other case, and that really does drop everything. This is on by default and can be
+  disabled in settings.
 - **No terminal access.** The extension tells Kiro it cannot run shell commands, so Kiro
   will not try.
 - Text coming back from Kiro is escaped before it is shown, so a reply cannot inject
@@ -238,11 +245,24 @@ All optional.
 | `kiroChat.command` | Path to `kiro-cli`. Leave empty to auto-detect. |
 | `kiroChat.args` | Extra arguments, e.g. `["--agent", "my-agent"]`. |
 | `kiroChat.env` | Extra environment variables for Kiro. |
-| `kiroChat.allowFileWrites` | Let Kiro edit files. Turn off for read-only chat. |
+| `kiroChat.allowFileWrites` | Let Kiro keep its edits. Turn off and every edit is undone at the end of the turn — see the note below. |
 | `kiroChat.autoApproveTools` | Skip the approval popup. Off by default. |
 | `kiroChat.reviewFileWrites` | Inline red/green review with whole-file and per-hunk decisions. On by default. |
+| `kiroChat.attachActiveFile` | Send the file you are looking at with each message. On by default. |
 | `kiroChat.sendSelection` | Send highlighted code with each message. |
 | `kiroChat.model` | The model to use. The dropdown sets this for you. |
+
+### What "read-only" actually means
+
+Worth being precise about, because it is not what you might assume. Kiro CLI 2.21 performs
+its own built-in file edits rather than asking this extension to make them, so there is no
+point at which the extension can decline one. Both `kiroChat.allowFileWrites` and **Plan**
+mode work by taking a snapshot before the turn and putting the file back at the end.
+
+The file therefore does change on disk, briefly, in the middle of the turn. Nothing you do
+in the editor will see it — the contents are restored before the turn finishes — but
+anything else watching the filesystem can: a dev server, a test watcher, a build, a file
+sync. If you need a guarantee that nothing is written at all, don't open the folder.
 
 Settings survive upgrades. If the saved path to Kiro ever stops working, for example
 because Kiro updated itself and moved, the extension clears it, goes back to searching, and
@@ -263,5 +283,6 @@ publishes nothing — the extension is installed from the `.vsix`, not from the 
 
 ## Not built yet
 
-Images, past sessions, and Kiro's slash commands all exist in the protocol but are not
-wired to the UI yet. The pieces are in `src/kiroSession.ts`.
+Kiro's slash commands exist in the protocol but are not wired to the UI yet. The pieces are
+in `src/kiroSession.ts`. Images and past chats used to be listed here; both are built now
+and have their own sections above.

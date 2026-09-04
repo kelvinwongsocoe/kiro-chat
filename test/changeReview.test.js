@@ -103,13 +103,17 @@ test("closing or cancelling a review rejects pending writes", () => {
 
 test("Kiro built-in FileWrite tools are staged even when they bypass the ACP callback", () => {
   assert.match(session, /beginTurnFileCapture\(usable\)/);
-  assert.match(session, /observeDirectFileWrite\(update\)/);
+  assert.match(session, /observeToolPaths\(update\)/);
   assert.match(session, /finishDirectFileReviews\(\)/);
   assert.match(session, /restoreSnapshot\(tracked\.before\)/);
   assert.match(session, /expectedToolResult/);
 });
 
 test("the file boundary checks every open root in a multi-root workspace", () => {
-  assert.match(session, /workspaceRoots\(\)\.some/);
+  // The walk over the roots — and the symlink resolution that goes with it —
+  // lives in workspacePaths.isInsideAnyRoot, exercised directly in
+  // test/workspaceBoundary.test.js. What has to hold here is that the boundary
+  // hands it *every* open root rather than only the cwd.
+  assert.match(session, /isInsideAnyRoot\(this\.workspaceRoots\(\)/);
   assert.match(session, /outside the open folders/);
 });

@@ -1077,29 +1077,48 @@ test("the webview reports a drop even when it read nothing", () => {
 });
 
 /**
- * A webview cannot accept a drop. VS Code's WebviewElement runs
+ * Dragging into the panel is unreliable and always was. VS Code's
+ * WebviewElement runs
  *
  *   windowDidDragStart() -> element.style.pointerEvents = "none"
  *
- * for the duration of any drag anywhere in the window, so no drag event ever
- * reaches the panel and nothing inside the webview can change that. Dragging a
- * file in is done on the native chat box instead, via the @kiro participant.
+ * for the duration of any drag anywhere in the window, so a plain drag never
+ * reaches the panel and nothing inside the webview can change that.
+ *
+ * The `@kiro` participant used to be the answer, because the native chat box is
+ * ordinary workbench DOM. It was removed in 0.24.0 as an undocumented second
+ * entry point nobody used, which leaves the routes that do not depend on a drop
+ * landing: the attach menu, the Explorer's context-menu command, and paste. At
+ * least one of those has to stay reachable, or files cannot be attached at all.
  */
-test("dropping files is offered through the native chat box", () => {
+test("files can be attached without relying on a drop", () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(root, "package.json"), "utf8"));
+
+  const commands = pkg.contributes.commands.map((c) => c.command);
   assert.ok(
-    (pkg.contributes.chatParticipants ?? []).length > 0,
-    "the participant is the only place a drop can land"
+    commands.includes("kiroChat.addFileToContext"),
+    "the Explorer command is the route that does not involve dragging at all"
+  );
+  assert.ok(
+    (pkg.contributes.menus["explorer/context"] ?? []).some(
+      (item) => item.command === "kiroChat.addFileToContext"
+    ),
+    "and it has to actually appear in the Explorer's right-click menu"
   );
 
-  const views = pkg.contributes.views.kiroChat ?? [];
-  assert.ok(
-    !views.some((v) => v.id === "kiroChat.drop"),
-    "the drop-target view was removed; the chat box replaces it"
-  );
+  for (const action of ["attachFiles", "attachFolders", "attachImage"]) {
+    assert.match(
+      provider,
+      new RegExp(`data-act="${action}"`),
+      `the attach menu must still offer ${action}`
+    );
+  }
+});
 
-  const participant = fs.readFileSync(path.join(root, "src", "participant.ts"), "utf8");
-  assert.match(participant, /filesFromReferences/, "attached files must reach Kiro");
+/** The drop handler stays, since a Shift-drag can still reach the panel. */
+test("the panel still listens for a drop even though one may never arrive", () => {
+  assert.match(js, /addEventListener\("drop"/, "the drop listener should remain");
+  assert.match(js, /addEventListener\("dragover"/, "and the dragover that shows the zone");
 });
 
 /**
@@ -1194,4 +1213,36 @@ test("the bar's buttons cannot be fired twice", () => {
   const body = render.slice(0, 2600);
   assert.match(body, /keep\.disabled = true/);
   assert.match(body, /undo\.disabled = true/);
+});
+
+/*
+ * The CSP nonce has to be unpredictable, because that is its entire job.
+ *
+ * It was built from Math.random(), which is seeded per process and recoverable
+ * from a handful of samples — so the one value standing between the page and an
+ * injected <script> was guessable. The page is otherwise locked down
+ * (default-src 'none', no inline handlers), and this closes the gap rather than
+ * relying on that.
+ */
+test("the CSP nonce comes from a cryptographic source", () => {
+  const body = provider.slice(provider.indexOf("function nonce("));
+  const head = body.slice(0, 400);
+  assert.match(head, /randomBytes\(/, "the nonce should be generated with crypto.randomBytes");
+  assert.doesNotMatch(head, /Math\.random/, "Math.random is not unpredictable");
+  assert.match(
+    provider,
+    /from "node:crypto"/,
+    "randomBytes has to actually be imported"
+  );
+});
+
+/** A nonce short enough to guess is no better than a predictable one. */
+test("the nonce carries enough entropy to be worth having", () => {
+  const body = provider.slice(provider.indexOf("function nonce("), provider.indexOf("function nonce(") + 400);
+  const bytes = body.match(/randomBytes\((\d+)\)/);
+  assert.ok(bytes, "the byte count should be explicit");
+  assert.ok(
+    Number(bytes[1]) >= 16,
+    `${bytes[1]} bytes is too few for a nonce; 16 is the usual floor`
+  );
 });
