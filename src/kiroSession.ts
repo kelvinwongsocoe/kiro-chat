@@ -8,6 +8,7 @@ import { ActiveReviewInfo, ChangeReviewer } from "./changeReviewer";
 import { isWriteLikeTool } from "./writeTools";
 import { changedSinceBaseline, describeChange, TurnChange } from "./turnChanges";
 import { findKiro } from "./findKiro";
+import { isInsideAnyRoot, isInsideRoot } from "./workspacePaths";
 import { looksLikeSignIn } from "./startupError";
 import {
   creditRateOf,
@@ -48,13 +49,6 @@ export type ContentBlock =
   | { type: "text"; text: string }
   | { type: "image"; data: string; mimeType: string }
   | { type: "resource_link"; uri: string; name: string; mimeType?: string };
-
-/** Somewhere other than the panel for one turn's output to go. */
-export interface TurnSink {
-  onText: (text: string) => void;
-  onThought?: (text: string) => void;
-  onTool?: (tool: ToolStep) => void;
-}
 
 export interface SendOptions {
   /** Refuse and restore all writes made during this turn. */
@@ -161,8 +155,23 @@ export function describeTool(update: any): ToolStep {
       : raw || "Working";
 
   const purpose = String(update?.rawInput?.__tool_use_purpose ?? "").trim();
+  /*
+   * A stable id when Kiro sends none.
+   *
+   * This used to fall back to Math.random(), which gave every notification
+   * about one step a different id — so instead of a row updating in place, the
+   * panel grew a fresh row for each update and a single step could fill the
+   * list. Deriving it from what the step *is* collapses the repeats.
+   *
+   * It cannot do better than that: the three notifications for one step carry
+   * different titles by design (see the comment above), so without a
+   * toolCallId there is nothing that ties them together. This is strictly
+   * fewer duplicate rows, not none.
+   */
+  const id =
+    String(update?.toolCallId ?? update?.id ?? "").trim() || `${kind || "tool"}:${raw}`;
   return {
-    id: String(update?.toolCallId ?? update?.id ?? Math.random()),
+    id,
     title,
     // Only `tool_call_update` carries a status; the earlier two are underway.
     status: String(update?.status ?? "running"),
@@ -208,12 +217,6 @@ export class KiroSession {
   /** True while session/load runs, so a replay does not double-paint. */
   private replaying = false;
   private textSpy: ((text: string) => void) | undefined;
-  /**
-   * Where this turn's output goes, when it is not the panel. VS Code's own
-   * chat box asks through `sendTo`, and its answer belongs in its response
-   * stream rather than in the webview's transcript.
-   */
-  private sink: TurnSink | undefined;
   private readonly changeReviewer: ChangeReviewer;
   /** Baselines are captured before Kiro's built-in tools can touch disk. */
   private readonly turnBaselines = new Map<string, FileSnapshot>();
@@ -323,14 +326,10 @@ export class KiroSession {
     return roots.length > 0 ? roots : [os.homedir()];
   }
 
+  // One definition of containment, shared with the boundary check below, so
+  // the two cannot drift into disagreeing about what "inside" means.
   private isInside(root: string, full: string): boolean {
-    const relative = path.relative(root, full);
-    return (
-      relative === "" ||
-      (relative !== ".." &&
-        !relative.startsWith(`..${path.sep}`) &&
-        !path.isAbsolute(relative))
-    );
+    return isInsideRoot(root, full);
   }
 
   private displayPath(full: string): string {
@@ -442,27 +441,20 @@ export class KiroSession {
   }
 
   /**
-   * Ask Kiro something on behalf of VS Code's own chat box, streaming the
-   * answer into the caller's sink instead of the panel's transcript.
+   * Ask Kiro something. One conversation means one turn at a time.
    *
-   * The two share one Kiro session deliberately: the conversation is the same
-   * conversation whichever box it was typed into, so credits, context and
-   * memory all stay in one place rather than running a second agent.
+   * The busy check matters because this is reachable without passing the
+   * webview's disabled Send button: `kiroChat.explainSelection` calls it
+   * through the provider, so a right-click mid-turn would otherwise put a
+   * second `session/prompt` on one session.
    */
-  async sendTo(blocks: ContentBlock[], sink: TurnSink): Promise<void> {
-    if (this.sink) throw new Error("Kiro is already answering another question.");
-    if (this.status === "busy") {
+  async send(blocks: ContentBlock[], options: SendOptions = {}): Promise<void> {
+    // Read through the getter, as `runCommand` does: checking `this.status`
+    // here narrows it for the rest of the method, and the `finally` below
+    // legitimately expects it to be "busy" by then.
+    if (this.currentStatus === "busy") {
       throw new Error("Kiro is still working on the last message. Wait for it to finish.");
     }
-    this.sink = sink;
-    try {
-      await this.send(blocks);
-    } finally {
-      this.sink = undefined;
-    }
-  }
-
-  async send(blocks: ContentBlock[], options: SendOptions = {}): Promise<void> {
     await this.ensureReady();
     if (!this.client || !this.sessionId) return;
 
@@ -475,7 +467,16 @@ export class KiroSession {
     this.beginTurnFileCapture(usable);
     this.setStatus("busy");
     try {
-      // Kiro's docs call this field `content`; the ACP spec calls it `prompt`.
+      /*
+       * Kiro's docs call this field `content`; the ACP spec calls it `prompt`.
+       *
+       * Deliberately sent with no timeout, unlike every other call that can
+       * silently never answer. A turn is different in kind: an agentic run
+       * editing several files legitimately takes as long as it takes, and any
+       * threshold worth setting would eventually cut a real one short. Stop is
+       * already there for a turn that has genuinely wedged, and that is the
+       * user's judgement rather than a guess made here.
+       */
       const result = await this.client.request("session/prompt", {
         sessionId: this.sessionId,
         prompt: usable,
@@ -483,16 +484,12 @@ export class KiroSession {
       });
       await this.finishDirectFileReviews();
       this.reportTurnChanges();
-      // A sink means someone else asked and is showing the answer; the panel
-      // must not also declare the turn over, and the error belongs to the
-      // caller rather than to the transcript.
-      if (!this.sink) this.events.onTurnEnd(result?.stopReason);
+      this.events.onTurnEnd(result?.stopReason);
     } catch (err) {
       // An edit can succeed before a later tool fails. It still needs to be
       // restored and reviewed instead of being left behind silently.
       await this.finishDirectFileReviews();
       this.reportTurnChanges();
-      if (this.sink) throw err;
       this.events.onError(err instanceof Error ? err.message : String(err));
       this.events.onTurnEnd("error");
     } finally {
@@ -712,17 +709,13 @@ export class KiroSession {
     switch (kind) {
       case "agent_message_chunk": {
         const text = contentToText(update.content);
-        // A command is collecting, a chat participant is streaming, or the
-        // panel is the audience — in that order of precedence.
+        // A command is collecting, or the panel is the audience.
         if (this.textSpy) this.textSpy(text);
-        else if (this.sink) this.sink.onText(text);
         else this.events.onText(text);
         break;
       }
       case "agent_thought_chunk": {
-        const thought = contentToText(update.content);
-        if (this.sink) this.sink.onThought?.(thought);
-        else this.events.onThought(thought);
+        this.events.onThought(contentToText(update.content));
         break;
       }
       // `tool_call_chunk` is the first word that a step is starting, and it
@@ -736,8 +729,7 @@ export class KiroSession {
         this.output.appendLine(
           `[tool] ${tool.status} ${tool.title}${tool.purpose ? ` — ${tool.purpose}` : ""}`
         );
-        if (this.sink) this.sink.onTool?.(tool);
-        else this.events.onTool(tool);
+        this.events.onTool(tool);
         break;
       }
       case "turn_end":
@@ -770,12 +762,36 @@ export class KiroSession {
     }
   }
 
+  /**
+   * The security boundary. Every path Kiro asks for goes through here — do not
+   * route file access around it.
+   *
+   * Containment is tested against the *real* locations, not the paths as
+   * written. Resolving the string defeats `../`, but it says nothing about a
+   * symlink or a Windows junction inside the workspace pointing out of it:
+   * that resolves to an in-workspace string and used to be accepted, which is
+   * not what the README promises. `realPathOf` handles a file that does not
+   * exist yet by resolving the nearest existing ancestor.
+   *
+   * The path handed back is still the one that was asked for, not its resolved
+   * form, so a link inside the workspace keeps working as a link once it has
+   * been shown to lead somewhere allowed.
+   */
   private resolveInsideWorkspace(target: string): string {
     const full = path.resolve(this.workspaceRoot(), target);
-    if (this.workspaceRoots().some((root) => this.isInside(root, full))) return full;
+    if (isInsideAnyRoot(this.workspaceRoots(), full)) return full;
     throw new Error(`Path is outside the open folders: ${target}`);
   }
 
+  /*
+   * Deliberately no size cap on what this will read.
+   *
+   * A large file is a memory spike at both ends, but a file Kiro asks for is
+   * one it needs to answer the question it was given, and refusing at some
+   * arbitrary threshold would fail the turn for a reason the user cannot see or
+   * act on. Kiro already asks for `line`/`limit` when it only wants part of a
+   * file, which is the mechanism that actually keeps these reads small.
+   */
   private async readFile(params: any): Promise<string> {
     const full = this.resolveInsideWorkspace(String(params?.path ?? ""));
     const text = await fs.readFile(full, "utf8");
@@ -1283,8 +1299,23 @@ export class KiroSession {
 
     if (options.length === 0) return { outcome: { outcome: "cancelled" } };
 
-    const allowOption = () =>
-      options.find((o) => String(o.kind ?? "").startsWith("allow")) ?? options[0];
+    /*
+     * Prefer the narrowest grant Kiro offered.
+     *
+     * ACP sends allow_once and allow_always side by side, and taking whichever
+     * arrived first meant an auto-approval could hand out a standing
+     * permission when a single-use one was on the table. Nothing here should
+     * grant more than the moment needs.
+     */
+    const allowOption = () => {
+      const kindOf = (option: any) =>
+        String(option?.kind ?? "").replace(/[-\s]/g, "_").toLowerCase();
+      return (
+        options.find((option) => kindOf(option) === "allow_once") ??
+        options.find((option) => kindOf(option).startsWith("allow")) ??
+        options[0]
+      );
+    };
 
     if (autoApprove) {
       const allow = allowOption();

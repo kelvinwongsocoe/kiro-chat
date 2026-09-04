@@ -151,6 +151,17 @@ export class ChangeReviewer implements vscode.CodeLensProvider, vscode.Disposabl
   private generation = 0;
   private registered = false;
   private readonly documents = new Map<string, string>();
+  /**
+   * Settled reviews whose tab nothing could close, so their content is being
+   * kept until the user closes it themselves.
+   *
+   * This has to be an explicit set rather than "any review document that is
+   * not the active one". `applyLanguage` recreates the document and fires
+   * onDidCloseTextDocument for the old one *before* `active` is assigned, so
+   * that test would match the review currently opening and delete the content
+   * out from under it — the diff would render empty.
+   */
+  private readonly orphaned = new Set<string>();
   private readonly registrations: vscode.Disposable[] = [];
   private documentEmitter: vscode.EventEmitter<vscode.Uri> | undefined;
   private codeLensEmitter: vscode.EventEmitter<void> | undefined;
@@ -283,6 +294,7 @@ export class ChangeReviewer implements vscode.CodeLensProvider, vscode.Disposabl
     for (const registration of this.registrations) registration.dispose();
     this.registrations.length = 0;
     this.documents.clear();
+    this.orphaned.clear();
   }
 
   /** Reject the visible review and anything queued behind it. */
@@ -345,10 +357,18 @@ export class ChangeReviewer implements vscode.CodeLensProvider, vscode.Disposabl
         if (event.document.uri.scheme === REVIEW_SCHEME) this.schedulePaint();
       }),
       vscode.workspace.onDidCloseTextDocument((document) => {
+        const key = document.uri.toString();
         const review = this.active;
-        if (review && document.uri.toString() === review.uri.toString() && !review.settled) {
+        if (review && key === review.uri.toString() && !review.settled) {
           // Closing keeps what was already accepted; only undecided hunks go.
           void this.rejectAll(review, false, true);
+          return;
+        }
+        // A settled review whose tab could not be closed for it, now closed by
+        // hand. Drop the content so the map does not carry every review of the
+        // session. Only ones explicitly given up on — see `orphaned`.
+        if (this.orphaned.delete(key)) {
+          this.documents.delete(key);
         }
       })
     );
@@ -771,13 +791,58 @@ export class ChangeReviewer implements vscode.CodeLensProvider, vscode.Disposabl
     );
     review.resolve(decision);
 
-    const activeUri = vscode.window.activeTextEditor?.document.uri;
-    if (closeEditor && activeUri?.toString() === review.uri.toString()) {
-      void Promise.resolve(
-        vscode.commands.executeCommand("workbench.action.closeActiveEditor")
-      ).finally(() => this.documents.delete(review.uri.toString()));
-    } else {
-      this.documents.delete(review.uri.toString());
+    void this.closeReviewTab(review, closeEditor);
+  }
+
+  /**
+   * Close the review's tab wherever it is, not only when it happens to be the
+   * focused one.
+   *
+   * Accepting from the chat bar while looking at another file used to take the
+   * else branch of the old check: the tab stayed open while its backing content
+   * was deleted out from under it, leaving a stale `(Working Tree)` tab with
+   * nothing behind it. `tabGroups` can close a tab that is not active; the
+   * active-editor command stays as the fallback for when it is not available,
+   * which is also what the fake vscode in the tests provides.
+   *
+   * When nothing could close it, the content deliberately stays put. A leftover
+   * tab still showing the reviewed file reads far better than a blank one.
+   */
+  private async closeReviewTab(review: ActiveReview, closeEditor: boolean): Promise<void> {
+    const key = review.uri.toString();
+    const forget = (): void => {
+      this.documents.delete(key);
+    };
+    if (!closeEditor) {
+      forget();
+      return;
     }
+
+    const groups = vscode.window.tabGroups;
+    const mine = (groups?.all ?? [])
+      .flatMap((group) => group.tabs)
+      .filter((tab) => String((tab.input as any)?.uri ?? "") === key);
+    if (groups && mine.length > 0) {
+      try {
+        await groups.close(mine, true);
+        forget();
+        return;
+      } catch (err) {
+        this.output.appendLine(
+          `Could not close the review tab for ${review.request.path}: ${this.message(err)}`
+        );
+      }
+    }
+
+    if (vscode.window.activeTextEditor?.document.uri.toString() === key) {
+      await Promise.resolve(
+        vscode.commands.executeCommand("workbench.action.closeActiveEditor")
+      );
+      forget();
+      return;
+    }
+    // Nothing could close it. Keep the content so the tab is not left blank,
+    // and remember to clean up when the user closes it themselves.
+    this.orphaned.add(key);
   }
 }

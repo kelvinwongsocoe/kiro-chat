@@ -58,6 +58,23 @@ A feature almost always means editing both:
 
 `KiroSession.handleRequest` answers `fs/read_text_file`, `fs/write_text_file` and `session/request_permission`. **Every file path goes through `resolveInsideWorkspace`**, which accepts every root in a multi-root workspace and rejects anything outside all open folders. That function is the security boundary — don't route file access around it. Writes additionally check `kiroChat.allowFileWrites`.
 
+**Containment is tested on real paths, not written ones.** `resolveInsideWorkspace` defers
+to `isInsideAnyRoot` in `workspacePaths.ts` (free of `vscode`, so `test/workspaceBoundary.test.js`
+drives it against real junctions). Comparing the resolved string defeats `../`, but a symlink
+or a Windows junction *inside* the workspace pointing out of it resolves to an in-workspace
+string and used to be accepted — which is not what the README promises. Both sides are put
+through `realPathOf`, which handles a file that does not exist yet by resolving the nearest
+existing ancestor and rejoining the rest; resolving only the child would make every file
+under a symlinked workspace root look external. The path handed back is still the one that
+was asked for, so a link keeps working as a link once it has been shown to lead somewhere
+allowed.
+
+**`allowFileWrites: false` and Plan mode revert; they do not prevent.** Kiro CLI 2.21 makes
+its own edits, so there is no call to refuse — the file really is written and then restored
+from its pre-turn snapshot. Anything watching the filesystem sees the intermediate state.
+Say so plainly in any wording about read-only; the setting's description used to promise
+prevention.
+
 With `kiroChat.reviewFileWrites` enabled, `ChangeReviewer` holds the write request open and
 opens a read-only virtual source document in the editor. Theme-aware decorations mark pending
 deletions red and insertions green. A CodeLens provider supplies whole-file
