@@ -2,7 +2,7 @@
   "name": "kiro-chat",
   "displayName": "Kiro Chat",
   "description": "Chat with the Kiro agent inside VS Code, like Copilot Chat.",
-  "version": "0.26.0",
+  "version": "0.27.0",
   "publisher": "local",
   "license": "MIT",
   "engines": {
@@ -169,6 +169,11 @@
           },
           "default": [],
           "markdownDescription": "Extra arguments added before `acp`, for example `[\"--agent\", \"my-agent\"]`."
+        },
+        "kiroChat.askBeforeEdits": {
+          "type": "boolean",
+          "default": false,
+          "markdownDescription": "Ask permission before each edit **as well as** showing the diff afterwards. Off by default, because the diff asks the same question at the point where there is something to look at. Turn it on when stopping a write matters more than reviewing one: Kiro CLI writes files itself, so the diff can only put a file back, while this prompt is the one gate that can stop a write reaching disk at all."
         },
         "kiroChat.attachActiveFile": {
           "type": "boolean",

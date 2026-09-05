@@ -163,13 +163,84 @@ not ending in the extension matches no language, so the review would render as p
   generation up front and re-checks it after assigning `active`; a `cancelPending()` that
   arrived while the document was opening had nothing to cancel at the time.
 
-An edit gets **one** gate, not two. `askPermission` recognises a write-like tool
+**Supervision is one choice, and the mode is derived rather than stored.** `editModes.ts`
+(free of `vscode`, so `test/editModes.test.js` drives it) maps `manual` / `review` /
+`autopilot` onto the four write gates, and `editModeOf` reads them back. There is
+deliberately no `kiroChat.editMode` setting: a stored mode is a second source of truth that
+drifts the moment someone edits the JSON. A combination matching no mode returns `custom`,
+which the menu shows as a note and never offers as a choice — rounding it to the nearest
+mode would display a selected row that does not describe the settings, and the next click
+would then change ones the user never touched. `allowFileWrites: false` is `custom` on
+purpose: restoring every file afterwards is a dry run, not a degree of care.
+
+**Hover is a state, not a change of role.** `.permission-option:hover` and
+`.permission-option.primary` shared one rule, so hovering any option painted it as the
+recommended action — and since `.reject` was coloured by `:not(:hover)`, hovering **Reject**
+dropped its red and turned it primary blue. The most dangerous button became the one that
+looked recommended, exactly when the pointer was on it. Secondary hovers to
+`button-secondaryHoverBackground`, primary to `button-hoverBackground`, reject keeps its red
+and gains a red border. If a hover rule ever needs to change what a button *means*, the rule
+is wrong.
+
+**The mode picker holds all of "how is this conversation running".** Three groups in one
+menu: the workflow (`chatModes.ts`), the supervision (`editModes.ts`), and the two
+`MESSAGE_TOGGLES`. Supervision briefly had a settings gear of its own, which put "how
+closely am I watching Kiro" somewhere quite different from "how is Kiro approaching this
+task" — two halves of one question, and one of them dressed as configuration rather than a
+working choice. The gear is gone.
+
+They are separate **groups** and not one flat list because they are independent: Spec with
+Autopilot and Spec with Manual are both sensible. Four details that are easy to undo:
+
+- **Picking a workflow closes the menu; the other two rows leave it open.** A workflow is
+  the whole errand. Supervision and the toggles are things you might set two of, and
+  staying put is what shows the change landing.
+- **One-of rows are marked by the selection highlight, toggles by a drawn switch.** Both
+  wearing the highlight merged two switched-on toggles into a single blue slab, and a
+  highlight on several rows at once reads as "these were all chosen" directly under a group
+  that means "only this one". The switch was briefly a `✓` / `○` character, which is a glyph
+  pretending to be a control: nothing about it said it could be flipped, its two states were
+  different *shapes* rather than one thing moved, and it inherited whatever colour the text
+  had. `.menu-switch` is a track and a knob that slides, keyed off the row's own
+  `aria-checked` so the state has one source.
+- **No row flips itself.** `setEditMode` / `setSetting` post and wait;
+  `onDidChangeConfiguration` redraws. A failed write cannot leave a mark claiming a state
+  the settings are not in — the permission card's rule again. `setSetting` also checks an
+  untrusted key against `PANEL_SETTINGS` before writing, and `gatesForMode` refuses
+  anything that is not a named mode.
+- **`modeButtonLabel()` puts supervision on the button, but only when it is not Review.**
+  Manual and Autopilot change what happens to your files with nothing else on screen to say
+  so. Review is the default and Plan changes nothing, so neither is announced.
+
+This also replaced the old `defaults` message — keeping it would have given `sendSelection`
+two writers in `chat.js`.
+
+**The live card is pinned; the settled one is history.** `#permission-bar` sits between the
+transcript and the composer, above `#change-bar`, for the reason that bar gives: the turn is
+blocked on the question, Kiro goes on streaming, and in the transcript the card scrolls out
+of view exactly when it is needed. `addPermissionCard` branches on `settled` — live goes to
+the bar, settled into the agent bubble — and `retirePermissionCard` moves one across when
+the answer lands. Neither ever goes into `bubble.tools`, which folds. `.permission-done`
+also drops the focus-coloured border and the primary button's fill, or an answered card goes
+on looking like one waiting to be pressed.
+
+An edit gets **one** gate by default, not two — but `askBeforeEdits` makes it two, and the
+reasoning for the default is not the reasoning for a rule. `askPermission` recognises a write-like tool
 through `isWriteLikeTool` (`writeTools.ts`, shared with `observeDirectFileWrite` so the
 two cannot drift) and lets it through without a prompt whenever the review diff is
 actually going to open — that is, `reviewFileWrites` and `allowFileWrites` are on and the
 turn is not read-only. Asking "may I write this file?" before there is a diff to look at,
-and then asking "keep these changes?", is the same question twice and the first one is
-unanswerable. When no review will open, that prompt is the only gate there is, so it stays.
+and then asking "keep these changes?", is largely the same question twice, and the first is
+the harder one to answer. When no review will open, that prompt is the only gate there is,
+so it stays.
+
+**But the two questions are not identical, which is why `askBeforeEdits` exists.** Kiro CLI
+2.21 writes files itself, so the review can only restore one afterwards — the write really
+reaches disk, and anything watching the filesystem sees it. Only the prompt can stop that.
+Defaulting to one gate keeps a ten-edit turn from becoming twenty prompts; the setting
+exists because "stop it happening" and "let me read it afterwards" are different needs and
+only the user knows which they have. `askAnyway` therefore suppresses the skip, and is read
+per request rather than cached.
 
 The keep-or-undo control is `#change-bar`, pinned between the transcript and the composer
 rather than appended to the transcript. It appears the moment `ChangeReviewer` fires
@@ -214,6 +285,49 @@ be offering to undo nothing. The snapshots for the files that really changed sur
 passes Kiro's option ids and labels through `SessionEvents.onPermission`; the provider
 posts an inline permission card and resolves the request when `chat.js` returns a
 `permissionDecision`. The VS Code notification is only a fallback when no panel exists.
+
+**The card claims nothing until the extension has answered.** Clicking used to disable the
+buttons and write "Selected: Allow" on the spot, whatever became of the decision — and a
+request that had already gone (turn ended, stopped, errored) is dropped by the provider in
+silence, so the transcript kept a card reporting an approval Kiro never received. The click
+now only says "Sending…"; `permissionSettled` carries `ok: true` with the option or
+`ok: false`, and the card writes the outcome — or marks itself `permission-stale` — from
+that. Both halves have to exist, as ever.
+
+**A pending permission outlives the panel being rebuilt — for thirty seconds.**
+`view.onDidDispose` cannot tell a drag from a close: both destroy the webview, and only
+what happens next separates them, because a drag resolves a new view within milliseconds
+and a close never does. Cancelling there answered Kiro on the user's behalf every time they
+rearranged their editor; not cancelling at all left Kiro waiting on a panel that was never
+coming back. So `schedulePermissionCancel()` waits and sees, and `resolveWebviewView` calls
+it off through `keepPermissionsAlive()`. Nothing is scheduled when nothing is outstanding,
+and when the timer does fire it says so in the output channel — there is no panel left to
+tell. `pendingPermissions` stores the request beside its resolver so `onWebviewReady` can
+`repostPermissions()`; the `permission` case in `chat.js` ignores an id already on screen,
+so re-asking cannot stack two cards. Genuine teardown — `dispose()`, `newSession()`,
+`stop()` — still cancels at once, and every cancel posts `permissionSettled { ok: false }`
+so no card is left looking live.
+
+**`stop()` is the only Stop.** The webview's `stop` message used to cancel pending
+permissions while the `kiroChat.stop` command called `session.cancel()` alone, so stopping
+from the Command Palette left a live card answering to nobody. Both go through `stop()`.
+
+**The numbers on the options are a promise, and it is kept where it can be.** Options
+render as `1  Allow`, `2  Reject`, which reads as "press that key"; nothing listened. The
+document `keydown` handler answers the live card on `1`–`9` — but only when the composer is
+empty, because `setBusy` disables Send and not the textarea, so the box holds focus for
+most of a turn and a digit while something is being written is text. `livePermissionCard()`
+is the newest card with no choice made and no `permission-done`.
+
+**Only an allow may be the primary button.** The rule was
+`kind.startsWith("allow") || index === 0`, which painted a refusal sent first as the
+recommended action, with both classes at once. `reject` is decided first, and the
+first-option fallback applies only when no option declares itself an allow.
+
+**A permission goes into the chat's record.** It lived only in the DOM, so reopening a chat
+left no trace that Kiro had asked to do anything. `recordPermission` stores
+`role: "permission"` with the title, options and choice, and `restoreHistory` rebuilds the
+same card with `settled: true` — buttons spent, choice marked. One card renderer, not two.
 
 **Neither is `isWriteLikeTool`, and for the same reason.** It used to gate the pre-turn
 snapshot in `observeToolPaths` (called `observeDirectFileWrite` until 0.25.0, when it
@@ -353,7 +467,7 @@ a global cap let a busy project evict a quiet one's history.
 
 ### Modules kept free of `vscode` on purpose
 
-`src/usage.ts`, `src/setupWatcher.ts`, `src/startupError.ts`, `src/history.ts`, `src/promptBlocks.ts` and the `needsShell`/`quote` exports of `src/acpClient.ts` have no `vscode` import so the tests can `require("../out/...")` directly. There is no VS Code test harness in this repo — that constraint is the entire testing strategy. Keep new parsing and logic modules importable without `vscode`.
+`src/usage.ts`, `src/setupWatcher.ts`, `src/startupError.ts`, `src/history.ts`, `src/promptBlocks.ts`, `src/editModes.ts` and the `needsShell`/`quote` exports of `src/acpClient.ts` have no `vscode` import so the tests can `require("../out/...")` directly. There is no VS Code test harness in this repo — that constraint is the entire testing strategy. Keep new parsing and logic modules importable without `vscode`.
 
 `setupWatcher.ts` additionally takes its timers through an injected `Scheduler`, so `test/setupWatcher.test.js` drives the whole state machine without waiting out a real interval. Follow that pattern for anything else that polls.
 
@@ -489,10 +603,11 @@ sentence down the middle, which is the same bug pointing the other way.
 so the table and fence tests assert on rendered HTML rather than on the shape of the
 source. Prefer that to a regex whenever the thing under test is a behaviour.
 
-**Do not slice a fixed number of characters out of a function to assert on it.** Four
-tests did (`slice(0, 2600)`, `slice(0, 400)` twice, `slice(0, 500)`) and every one of them
-failed for a comment being added above the line they wanted — a test that breaks when
-nothing broke. Slice to the next `case`, the next `function`, or the end of the block.
+**Do not slice a fixed number of characters out of a function to assert on it.** Nine tests
+did — `slice(0, 2600)`, `slice(0, 2200)` three times, `slice(0, 1400)`, `slice(0, 1100)`,
+`slice(0, 500)`, `slice(0, 400)` twice — and every one failed for a comment being added
+above the line it wanted, which says nothing about whether the code is right. Slice to the
+next `case`, the next `function`, the next `private`, or the end of the block.
 
 **The code-block copy button is delegated, and it must stay that way.** A streaming reply
 runs `body.innerHTML = renderMarkdown(buffer)` on every frame, so a listener bound to the

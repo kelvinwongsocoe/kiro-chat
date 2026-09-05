@@ -1,5 +1,103 @@
 # Changelog
 
+## 0.27.0
+
+- **Manual, Review or Autopilot — in the mode picker, beside the workflow.** Choosing how
+  closely you watch Kiro work belongs next to choosing how Kiro approaches the task; they are
+  two halves of "how is this conversation running". The picker now holds three groups —
+  the workflow, the supervision, and what rides along with each message — and the separate
+  settings gear is gone.
+
+  They stay separate groups rather than one list of eight, because they are independent:
+  Spec with Autopilot and Spec with Manual are both sensible, and a flat list could not say
+  that. Plan says outright that none of it applies to it, since Plan changes nothing. And
+  because Manual and Autopilot change what happens to your files with nothing else on
+  screen to say so, they ride on the button itself — `Default · Autopilot`. Review is the
+  default and is not announced.
+
+  The three modes:
+
+  - **Manual** — ask before every edit, then show the diff.
+  - **Review** *(default)* — make the edit, then show the diff to keep or undo.
+  - **Autopilot** — edit freely. Nothing to approve, nothing to read.
+
+  These were four booleans in the settings, and their names actively misled: turning
+  `reviewFileWrites` off reads as turning safety off, when it only swaps which gate you get.
+  The mode is worked out from those settings rather than stored beside them, so it cannot
+  drift from what is actually configured — and a combination matching no mode is reported as
+  exactly that rather than rounded to the nearest one.
+
+  Manual is new. Asking before an edit *and* reviewing it afterwards used to be impossible,
+  on the reasoning that it is the same question twice. It is not quite: Kiro CLI writes files
+  itself, so the diff can only put one back after the fact, while the prompt is the only gate
+  that stops a write reaching disk at all. Which of those matters is not something a rule
+  should decide.
+
+  The two message toggles are drawn switches. Every row changes because the setting changed,
+  never because it was clicked, so a write that fails cannot leave one claiming
+  otherwise; and editing any of it in the settings
+  editor, the JSON, or another window updates the menu too. Picking a workflow closes the
+  menu, since that is the whole errand; the other two groups leave it open, because they are
+  things you might set two of.
+
+- **Fixed the permission buttons turning into each other on hover.** `:hover` and `.primary`
+  shared one rule, so putting the pointer on any option painted it as the recommended
+  action — and because the destructive one was coloured only while *not* hovered, hovering
+  **Reject** dropped its red and turned it primary blue. The most dangerous button in the
+  panel looked recommended at the exact moment the pointer was on it.
+
+  They now follow VS Code's own convention: a secondary button hovers to the secondary hover
+  colour, the primary deepens, Reject stays red and gains a red border, and no button ever
+  changes what it means. Keyboard focus is visible on its own, and the shortcut is drawn as a
+  key rather than a number stuck to the label.
+
+- **A permission card stays put while it waits for you.** It sat in the transcript, which
+  scrolls — and scrolls exactly when it matters, because Kiro keeps streaming while the turn
+  is blocked on your answer, so the question ends up somewhere above the fold. It now sits
+  between the conversation and the message box, where the keep-or-undo bar sits and for the
+  same reason. Once answered it moves into the conversation as a record of what was asked,
+  and stops looking like a question still standing.
+
+- **A permission card no longer reports an answer that reached nobody.** Clicking an option
+  disabled the buttons and wrote "Selected: Allow" straight away, whatever became of the
+  decision. If the request had already gone — the turn ended, was stopped, or errored — it
+  was dropped in silence, leaving a card in the transcript claiming an approval Kiro never
+  received. The click now says "Sending…", and the answer is written down only once the
+  extension confirms it landed. A request that has gone says so instead.
+
+- **Moving the chat panel no longer answers Kiro for you.** Dragging the view between the
+  sidebar, the bottom panel and the secondary sidebar destroys and rebuilds the webview,
+  and every pending permission was quietly cancelled on the way through — the action simply
+  did not happen, and the panel that came back showed no sign there had been a question.
+  The question is asked again on the other side.
+
+  A panel closed for good is a different matter, and closing one looks exactly like moving
+  one at the moment it happens — what tells them apart is that a move brings a panel back
+  within milliseconds. So the answer waits half a minute before deciding: come back and the
+  question is still there, stay away and it is cancelled, which is what used to happen
+  immediately. The output log says when that happens, since by then there is no panel to
+  say it in.
+
+- **Stop cancels the questions the turn was asking, whichever Stop you use.** The button in
+  the panel did; the `Kiro Chat: Stop` command did not, so stopping from the Command
+  Palette left a card on screen answering to nobody.
+
+- **The numbers on the options work.** They render as `1  Allow`, `2  Reject` — which reads
+  as "press that key" — and nothing listened for them; with the message box focused,
+  pressing `1` typed a `1`. They now answer the card whenever you are not part-way through
+  writing something.
+
+- **Permissions are kept in the chat's record.** They lived only on screen, so reopening a
+  chat left no trace that Kiro had asked to do something, or what you said. The card comes
+  back with your answer on it.
+
+- **A refusal can no longer be styled as the recommended action**, if Kiro ever sends it
+  first.
+
+- **`kiroChat.autoApproveTools` writes what it approved to the output log.** It granted
+  permissions silently, so with the setting on there was no record anywhere that anything
+  had been approved.
+
 ## 0.26.0
 
 - **Tables in a reply are rendered as tables.** There was no table support at all, so every

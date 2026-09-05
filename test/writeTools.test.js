@@ -76,7 +76,9 @@ const session = fs.readFileSync(
  */
 test("an edit is not also prompted for when the review will open", () => {
   const ask = session.slice(session.indexOf("private async askPermission"));
-  const body = ask.slice(0, 2200);
+  // The whole method. A fixed 2200 characters broke the moment a comment was
+  // added inside it, which says nothing about whether the code is right.
+  const body = ask.slice(0, ask.indexOf("\n  private "));
   assert.match(body, /isWriteLikeTool/, "askPermission must recognise an edit");
   assert.match(body, /reviewWillOpen/, "and skip its prompt when the diff is coming");
 });
@@ -85,9 +87,26 @@ test("an edit is not also prompted for when the review will open", () => {
  * With review off, writing off, or a read-only workflow, no diff opens — so
  * the permission prompt is the only gate there is and must still be asked.
  */
+/*
+ * The branch that lets an edit through without asking writes down that it
+ * did, and says why. Auto-approve returned in silence, so with
+ * `kiroChat.autoApproveTools` on there was no record anywhere — not the
+ * panel, not the log — that a permission had been granted at all.
+ */
+test("an auto-approved permission is written to the log", () => {
+  const ask = session.slice(session.indexOf("private async askPermission"));
+  const body = ask.slice(0, ask.indexOf("\n  private "));
+  const auto = body.slice(body.indexOf("if (autoApprove) {"));
+  const branch = auto.slice(0, auto.indexOf("\n    }"));
+  assert.match(branch, /this\.output\.appendLine\(/, "say that it was granted");
+  assert.match(branch, /autoApproveTools/, "and why it was never asked");
+});
+
 test("the prompt stays when no review will open", () => {
   const ask = session.slice(session.indexOf("private async askPermission"));
-  const body = ask.slice(0, 2200);
+  // The whole method. A fixed 2200 characters broke the moment a comment was
+  // added inside it, which says nothing about whether the code is right.
+  const body = ask.slice(0, ask.indexOf("\n  private "));
   for (const guard of ["reviewFileWrites", "allowFileWrites", "turnReadOnly"]) {
     assert.ok(body.includes(guard), `skipping the prompt must depend on ${guard}`);
   }

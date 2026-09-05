@@ -1457,6 +1457,15 @@ export class KiroSession {
 
     if (autoApprove) {
       const allow = allowOption();
+      // The other branch that answers without asking writes down that it did.
+      // This one did not, so with `autoApproveTools` on there was no record
+      // anywhere — not the panel, not the log — that a permission had been
+      // granted at all.
+      this.output.appendLine(
+        `Auto-approved (kiroChat.autoApproveTools): ` +
+          `${String(params?.toolCall?.title ?? params?.toolCall?.kind ?? "a tool")} ` +
+          `— chose "${String(allow?.name ?? allow?.optionId ?? allow?.id)}"`
+      );
       return { outcome: { outcome: "selected", optionId: allow.optionId ?? allow.id } };
     }
 
@@ -1477,7 +1486,21 @@ export class KiroSession {
       config.get<boolean>("allowFileWrites", true) &&
       !this.turnReadOnly;
 
-    if (reviewWillOpen && isWriteLikeTool(params?.toolCall ?? params)) {
+    /*
+     * Unless the user has asked for both, which is a fair thing to want.
+     *
+     * The one-gate rule above is about not asking the same question twice —
+     * but the two questions are not quite the same. Kiro CLI 2.21 writes files
+     * itself, so the review can only put a file back after the fact: anything
+     * watching the filesystem has already seen the write. This prompt is the
+     * only gate that can stop one reaching disk. Defaulting to a single gate
+     * keeps a ten-edit turn from becoming twenty prompts; `askBeforeEdits`
+     * exists because "stop it before it happens" is a different need from
+     * "let me read it afterwards", and only the user knows which they have.
+     */
+    const askAnyway = config.get<boolean>("askBeforeEdits", false);
+
+    if (!askAnyway && reviewWillOpen && isWriteLikeTool(params?.toolCall ?? params)) {
       const allow = allowOption();
       this.output.appendLine(
         `Letting an edit through without a prompt; the review diff is the gate: ` +
