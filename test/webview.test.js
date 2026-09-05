@@ -73,6 +73,9 @@ test("the hidden attribute wins over our own display rules", () => {
     ".popup {",
     ".usage-panel {",
     ".icon {",
+    // The pinned permission bar joined this list when the card stopped living
+    // in the transcript: it is toggled with `hidden` and sets `display: flex`.
+    ".permission-bar {",
   ]) {
     const at = css.indexOf(selector);
     assert.ok(at > -1, `${selector} should exist`);
@@ -249,11 +252,16 @@ test("the selection chip cannot be dismissed while the code is highlighted", () 
 
   // With no per-message choice left, the setting is the only thing deciding.
   assert.doesNotMatch(js, /restoredChoice/, "a restored panel has no choice to protect");
+  // The setting always wins, and it now arrives as one of the five the panel
+  // reports rather than in a `defaults` message of its own — one writer for
+  // `includeSelection`, not two.
   assert.match(
     js,
-    /if \(typeof message\.sendSelection === "boolean"\) \{/,
+    /if \(typeof settings\.sendSelection === "boolean"\) \{/,
     "so the setting always wins"
   );
+  assert.doesNotMatch(js, /case "defaults":/, "and it has one message, not two");
+  assert.doesNotMatch(provider, /type: "defaults"/);
   assert.doesNotMatch(
     manifest.contributes.configuration.properties["kiroChat.sendSelection"].description,
     /per message using the chip/,
@@ -629,7 +637,10 @@ test("a finished turn reads as one sentence", () => {
   // A stored chat has no timing, so the sentence stops short rather than
   // claiming a duration it does not have.
   const restore = js.slice(js.indexOf("function restoreHistory(saved)"));
-  assert.match(restore.slice(0, 1400), /"Completed 1 step" : `Completed \$\{steps\.length\} steps`/);
+  assert.match(
+    restore.slice(0, restore.indexOf("\n  function ")),
+    /"Completed 1 step" : `Completed \$\{steps\.length\} steps`/
+  );
 });
 
 test("the steps fold away behind the header", () => {
@@ -661,12 +672,233 @@ test("the steps fold away behind the header", () => {
   assert.match(stopBody, /group\.steps\.hidden = false/, "and the log survives the turn");
 
   // A permission card inside a folded list is one the user cannot answer,
-  // and the turn would hang waiting for them.
+  // and the turn would hang waiting for them. Neither the pinned live card
+  // nor the settled one in the transcript may go near `bubble.tools`.
   const card = js.slice(js.indexOf("function addPermissionCard(permission)"));
+  const cardBody = card.slice(0, card.indexOf("\n  /** A card by request id"));
   assert.match(
-    card.slice(0, 2200),
+    cardBody,
     /root\.insertBefore\(card, bubble\.body\)/,
-    "the permission card must never go inside the steps list"
+    "the settled card sits above the reply, not in the steps list"
+  );
+  assert.doesNotMatch(cardBody, /bubble\.tools/, "and never inside the steps list");
+});
+
+/*
+ * A permission card must not report an answer that reached nobody.
+ *
+ * Clicking used to disable the buttons and write "Selected: Allow" on the
+ * spot, whatever became of the decision. A request that had already gone —
+ * the turn ended, was stopped, or errored — is dropped by the provider in
+ * silence, so a card sat in the transcript claiming an approval Kiro never
+ * received. The extension answers now, and only then is anything written.
+ */
+test("a permission card writes down its answer only once it is acknowledged", () => {
+  const card = js.slice(js.indexOf("function addPermissionCard(permission)"));
+  const body = card.slice(0, card.indexOf("\n  function "));
+  const click = body.slice(body.indexOf('button.addEventListener("click"'));
+  assert.doesNotMatch(
+    click,
+    /Selected: \$\{option\.label\}/,
+    "the click must not claim the decision landed"
+  );
+  assert.match(click, /status\.textContent = "Sending…";/, "it says it is in flight");
+
+  // Both halves, or the card waits forever for a message nobody sends.
+  assert.match(provider, /type: "permissionSettled", requestId, ok: false/, "refusals are told");
+  assert.match(provider, /type: "permissionSettled", requestId, ok: true, optionId/);
+  assert.match(js, /case "permissionSettled": \{/, "and the webview handles it");
+  assert.match(js, /permission-stale/, "a dead request says so");
+  assert.match(css, /^\.permission-stale \.permission-status \{/m);
+});
+
+/*
+ * Two Stop paths disagreed. The webview's `stop` message cancelled pending
+ * permissions; the `kiroChat.stop` command called `session.cancel()` alone, so
+ * stopping from the Command Palette left a live card answering to nobody.
+ */
+test("stopping a turn cancels its questions, by either route", () => {
+  const stop = provider.slice(provider.indexOf("  stop(): void {"));
+  const body = stop.slice(0, stop.indexOf("\n  async "));
+  assert.match(body, /this\.cancelPendingPermissions\(\);/, "Stop abandons the questions too");
+  assert.match(body, /this\.session\.cancel\(\);/);
+  // And the webview's case goes through it rather than round it.
+  const message = provider.slice(provider.indexOf('case "stop":'));
+  assert.match(message.slice(0, 400), /this\.stop\(\);/, "one path, not two");
+});
+
+/*
+ * Dragging the panel between the sidebar and the bottom panel destroys the
+ * webview. That used to answer Kiro "cancelled" on the user's behalf and say
+ * so nowhere: the action quietly did not happen, and the rebuilt panel showed
+ * no sign there had been a question. The request is still open, so it is
+ * asked again.
+ */
+test("a pending permission survives the panel being rebuilt", () => {
+  const dispose = provider.slice(provider.indexOf("view.onDidDispose(() => {"));
+  const body = dispose.slice(0, dispose.indexOf("});"));
+  assert.doesNotMatch(
+    body,
+    /cancelPendingPermissions/,
+    "a layout change is not an answer to a permission request"
+  );
+  assert.match(provider, /private repostPermissions\(\): void \{/, "it is asked again instead");
+  assert.match(provider, /this\.repostPermissions\(\);/);
+  // Genuine teardown still cancels, or Kiro waits on a panel that is gone.
+  const teardown = provider.slice(provider.indexOf("  dispose(): void {"));
+  const teardownBody = teardown.slice(0, teardown.indexOf("\n  }"));
+  assert.match(teardownBody, /cancelPendingPermissions/);
+  assert.match(teardownBody, /keepPermissionsAlive/, "and no timer outlives it");
+  // The request is kept beside its resolver so there is something to re-post.
+  assert.match(provider, /request: \{ title: string; options:/, "the question is kept, not just the resolver");
+  // And the same question arriving twice must not stack up two cards.
+  assert.match(js, /if \(!already\) addPermissionCard\(asked\);/);
+});
+
+/*
+ * The question is pinned; the answer is history.
+ *
+ * A live card used to sit in the transcript, which scrolls — and it scrolls
+ * exactly when it matters, because Kiro goes on streaming while the turn is
+ * blocked on you, so the thing waiting for an answer ends up somewhere above
+ * the fold. It lives between the transcript and the message box now, the same
+ * place and for the same reason as the keep-or-undo bar. Once answered it is
+ * a record of what was asked, so it joins the conversation.
+ */
+test("a permission card waiting for an answer does not scroll away", () => {
+  assert.match(provider, /id="permission-bar" class="permission-bar" hidden/);
+  // Above the keep-or-undo bar: one blocks the turn, the other reports on a
+  // turn that has finished.
+  const bar = provider.indexOf('id="permission-bar"');
+  const change = provider.indexOf('id="change-bar"');
+  const input = provider.indexOf('id="input"');
+  assert.ok(bar > -1 && bar < change && change < input, "pinned above the message box");
+  assert.match(css, /^\.permission-bar \{/m);
+
+  const card = js.slice(js.indexOf("function addPermissionCard(permission)"));
+  const body = card.slice(0, card.indexOf("\n  /** A card by request id"));
+  assert.match(body, /permissionBar\.appendChild\(card\);/, "a live card is pinned");
+  assert.match(body, /permissionBar\.hidden = false;/);
+  assert.match(js, /function retirePermissionCard\(card\)/, "and an answered one moves");
+  assert.match(js, /retirePermissionCard\(card\);/);
+  assert.match(
+    js,
+    /permissionBar\.hidden = permissionBar\.children\.length === 0;/,
+    "the bar goes away when nothing is being asked"
+  );
+  // The digit shortcut answers what is pinned, not something scrolled past.
+  const live = js.slice(js.indexOf("function livePermissionCard()"));
+  assert.match(live.slice(0, 400), /permissionBar\.querySelectorAll/);
+});
+
+/*
+ * Both gates, for anyone who wants them.
+ *
+ * The default is one gate — asking before an edit and then again after it is
+ * twenty prompts in a ten-edit turn. But the two questions are not the same:
+ * Kiro CLI writes files itself, so the review can only put a file back, while
+ * the prompt is the only thing that can stop a write reaching disk. Which of
+ * those matters is the user's call, not a rule.
+ */
+test("asking before an edit as well as reviewing it is available", () => {
+  const manifestSetting = manifest.contributes.configuration.properties["kiroChat.askBeforeEdits"];
+  assert.ok(manifestSetting, "the setting has to be declared");
+  assert.equal(manifestSetting.default, false, "one gate stays the default");
+
+  const session = fs.readFileSync(path.join(root, "src", "kiroSession.ts"), "utf8");
+  const ask = session.slice(session.indexOf("private async askPermission"));
+  const body = ask.slice(0, ask.indexOf("\n  private "));
+  assert.match(body, /const askAnyway = config\.get<boolean>\("askBeforeEdits", false\);/);
+  assert.match(
+    body,
+    /if \(!askAnyway && reviewWillOpen && isWriteLikeTool/,
+    "and it has to actually suppress the skip"
+  );
+  // Reachable without the JSON editor, since that is the point — as the
+  // Manual mode, which is the one this setting exists to make possible.
+  assert.ok(js.includes('id: "manual"'), "Manual is what turns both gates on");
+  assert.match(provider, /"askBeforeEdits",/, "and the panel may write it");
+});
+
+/*
+ * A view closed for good must not leave Kiro waiting forever.
+ *
+ * `onDidDispose` cannot tell a drag from a close — both destroy the webview,
+ * and only what happens next tells them apart. So the cancel is delayed
+ * rather than skipped: a drag resolves a new view in milliseconds and calls
+ * it off, and a close never does, so the timer eventually does exactly what
+ * disposing used to do immediately.
+ */
+test("a permission left behind by a closed panel is cancelled in the end", () => {
+  assert.match(provider, /const PERMISSION_GRACE_MS = 30_000;/, "the wait is named");
+  assert.match(provider, /private schedulePermissionCancel\(\): void \{/);
+  assert.match(provider, /private keepPermissionsAlive\(\): void \{/);
+
+  // Nothing outstanding, nothing scheduled: closing an idle panel starts no
+  // timer at all.
+  const schedule = provider.slice(provider.indexOf("private schedulePermissionCancel"));
+  const body = schedule.slice(0, schedule.indexOf("\n  /**"));
+  assert.match(body, /if \(this\.pendingPermissions\.size === 0\) return;/);
+  assert.match(body, /this\.cancelPendingPermissions\(\);/, "and it really does cancel");
+  assert.match(body, /this\.output\.appendLine\(/, "said out loud — no panel is left to tell");
+
+  // A view coming back is the observation that calls it off.
+  const resolve = provider.slice(provider.indexOf("resolveWebviewView(view: vscode.WebviewView)"));
+  assert.match(resolve.slice(0, 600), /this\.keepPermissionsAlive\(\);/);
+  const dispose = provider.slice(provider.indexOf("view.onDidDispose(() => {"));
+  assert.match(dispose.slice(0, dispose.indexOf("});")), /this\.schedulePermissionCancel\(\);/);
+});
+
+/*
+ * The options render as "1  Allow", "2  Reject", which every terminal prompt
+ * has taught people to read as "press that key". Nothing listened for them.
+ */
+test("the numbers on a permission card actually work", () => {
+  assert.match(js, /function livePermissionCard\(\)/, "there has to be a card to answer");
+  const keys = js.slice(js.indexOf('document.addEventListener("keydown"'));
+  const body = keys.slice(0, keys.indexOf("\n  });"));
+  assert.match(body, /\/\^\[1-9\]\$\/\.test\(event\.key\)/, "a digit answers the card");
+  assert.match(body, /button\.click\(\);/);
+  assert.match(body, /event\.preventDefault\(\);/, "so it is not also typed");
+  /*
+   * Only when the composer is empty. It keeps focus for most of a turn —
+   * `setBusy` disables Send, not the textarea — so a digit while something is
+   * being written is text, and the buttons are still there to click.
+   */
+  assert.match(body, /el\.tagName === "TEXTAREA" && String\(el\.value \|\| ""\)\.trim\(\) !== ""/);
+});
+
+/*
+ * A permission lived only in the DOM, so reopening a chat left no trace that
+ * Kiro had asked to do something or what was said back — the record most
+ * worth keeping, for the one feature whose point is being asked first.
+ */
+test("a permission is kept in the chat's own record", () => {
+  assert.match(js, /function recordPermission\(card, settled\)/);
+  assert.match(js, /role: "permission",/, "it is its own kind of entry");
+  const restore = js.slice(js.indexOf("function restoreHistory(saved)"));
+  const body = restore.slice(0, restore.indexOf("\n  function "));
+  assert.match(body, /item\.role === "permission"/, "and it comes back");
+  // The same card with its buttons spent, not a second way of drawing one.
+  assert.match(body, /settled: true/);
+  assert.match(js, /if \(permission\.settled\) \{/);
+  assert.match(css, /^\.permission-done \.permission-title \{/m);
+});
+
+/*
+ * `kind.startsWith("allow") || index === 0` painted whatever came first as
+ * the recommended action — so a refusal sent first got the primary treatment,
+ * and both classes at once.
+ */
+test("only an allow may be the primary button", () => {
+  const card = js.slice(js.indexOf("function addPermissionCard(permission)"));
+  const body = card.slice(0, card.indexOf("\n  function "));
+  assert.match(body, /const declaresAllow = options\.some/, "is there an allow at all?");
+  assert.match(body, /if \(isReject\) button\.classList\.add\("reject"\);/, "reject decides first");
+  assert.match(
+    body,
+    /else if \(kind\.startsWith\("allow"\) \|\| \(!declaresAllow && index === 0\)\)/,
+    "and the first-option fallback may not overrule it"
   );
 });
 
@@ -694,7 +926,7 @@ test("a tool row shows its state, without a column of ticks mid-turn", () => {
 
   const restore = js.slice(js.indexOf("function restoreHistory(saved)"));
   assert.match(
-    restore.slice(0, 1100),
+    restore.slice(0, restore.indexOf("\n  function ")),
     /renderToolRow\(row, tool, "restored"\)/,
     "a chat from last week is not still working"
   );
@@ -789,6 +1021,152 @@ test("the menus are anchored inside a positioned parent", () => {
   assert.match(css, /\.attach-wrap \{[^}]*position: relative/);
   assert.match(css, /\.composer \{[^}]*position: relative/);
   assert.match(provider, /<div class="attach-wrap">[\s\S]*?id="attach-menu"/);
+});
+
+/*
+ * How the conversation runs is one menu, not a picker and a settings gear.
+ *
+ * Supervision lived behind a gear of its own, which put "how closely am I
+ * watching Kiro" somewhere quite different from "how is Kiro approaching this
+ * task" — two halves of one question, and one of them dressed as
+ * configuration rather than a working choice.
+ */
+test("the mode picker carries the workflow, the supervision and what is sent", () => {
+  assert.doesNotMatch(provider, /id="settings-btn"/, "the separate gear is gone");
+  assert.doesNotMatch(js, /renderSettingsMenu/);
+  assert.doesNotMatch(css, /\.settings-menu/);
+
+  const render = js.slice(js.indexOf("function renderModeMenu()"));
+  const body = render.slice(0, render.indexOf("\n  /**"));
+  assert.match(body, /menuHeading\("Workflow"\)/);
+  assert.match(body, /menuHeading\(\s*\n?\s*"When Kiro edits a file"/);
+  assert.match(body, /menuHeading\("Sent with each message"\)/);
+  assert.match(css, /^\.menu-head \{/m, "the groups need to be told apart");
+
+  // The four write gates are one choice, not four booleans: named modes say
+  // what the settings are about, where "reviewFileWrites" actively misled.
+  assert.match(js, /const EDIT_MODES = \[/, "supervision is one choice");
+  for (const id of ["manual", "review", "autopilot"]) {
+    assert.ok(js.includes(`id: "${id}"`), `${id} belongs in the menu`);
+  }
+  // What rides along with a message is a separate matter, and stays a toggle.
+  assert.match(js, /const MESSAGE_TOGGLES = \[/);
+  for (const key of ["attachActiveFile", "sendSelection"]) {
+    assert.ok(js.includes(`key: "${key}"`), `${key} belongs in the menu`);
+  }
+
+  // Both halves, or a row does nothing and says nothing.
+  assert.match(js, /type: "setEditMode", mode: row\.dataset\.editMode/);
+  assert.match(provider, /case "setEditMode": \{/);
+  assert.match(js, /type: "setSetting",\s*\n?\s*key: row\.dataset\.setting/);
+  assert.match(provider, /case "setSetting": \{/);
+  assert.match(js, /case "settings":/, "and the answer comes back");
+  assert.match(provider, /private postSettings\(\): void \{/);
+});
+
+/*
+ * A toggle is a switch, not a character.
+ *
+ * It was a "✓" / "○" in front of the label — a glyph pretending to be a
+ * control. Nothing about it said it could be flipped, its two states were
+ * different *shapes* rather than one thing moved, and it took whatever colour
+ * the surrounding text happened to be.
+ */
+test("the message toggles are drawn switches", () => {
+  const render = js.slice(js.indexOf("function menuRow(options)"));
+  const body = render.slice(0, render.indexOf("\n  /*"));
+  assert.match(body, /track\.className = "menu-switch";/, "a switch, drawn");
+  assert.match(body, /track\.setAttribute\("aria-hidden", "true"\)/, "the row carries the state");
+  // Code, not comments: the comment here names the glyph it replaced, and
+  // reading that as code failed this on its own explanation.
+  const code = body.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+  assert.doesNotMatch(code, /✓|○/, "and no glyph standing in for a control");
+
+  // The knob moves; it is not two different marks.
+  assert.match(css, /^\.menu-switch \{[^}]*border-radius: 999px/m);
+  assert.match(css, /^\.menu-switch::after \{[^}]*border-radius: 50%/m);
+  assert.match(css, /\[aria-checked="true"\] > \.menu-switch::after \{[^}]*translateX/);
+  assert.match(css, /\[aria-checked="true"\] > \.menu-switch \{[^}]*background: var\(--vscode-button-background\)/);
+
+  // Sliding to the position is decoration; the position is the state.
+  const reduced = css.slice(css.lastIndexOf("@media (prefers-reduced-motion: reduce)"));
+  assert.match(css, /@media \(prefers-reduced-motion: reduce\) \{\s*\n\s*\.menu-switch,/);
+  assert.ok(reduced.length > 0);
+});
+
+/*
+ * Picking a workflow is the errand, so the menu closes. Supervision and the
+ * message toggles are things you might set two of, and staying open is what
+ * shows the change landing — they are also the rows that wait to be told
+ * rather than flipping themselves.
+ */
+test("only picking a workflow closes the mode menu", () => {
+  const handler = js.slice(js.indexOf('modeMenu.addEventListener("click"'));
+  const body = handler.slice(0, handler.indexOf("\n  });"));
+  const workflow = body.slice(body.indexOf("if (row.dataset.modeId)"));
+  assert.match(
+    workflow.slice(0, 300),
+    /setMenu\(modeMenu, modeBtn, false\);/,
+    "a workflow is chosen and the menu is done"
+  );
+  const rest = body.slice(body.indexOf("if (row.dataset.editMode)"));
+  assert.doesNotMatch(rest, /setMenu\(modeMenu, modeBtn, false\)/, "the others stay open");
+  assert.doesNotMatch(rest, /editMode = /, "and none of them flips itself");
+  assert.doesNotMatch(rest, /settings\[row\.dataset\.setting\] =(?!=)/);
+});
+
+/*
+ * Review is the default and needs no announcing. Manual and Autopilot change
+ * what happens to your files with nothing else on screen to say so, so they
+ * ride on the button where they cannot be missed.
+ */
+test("the button says so when supervision is not the default", () => {
+  const label = js.slice(js.indexOf("function modeButtonLabel()"));
+  const body = label.slice(0, label.indexOf("\n  }"));
+  assert.match(body, /editMode === "review"/, "the default is not announced");
+  assert.match(body, /currentModeId === "plan"/, "and Plan changes nothing anyway");
+  assert.match(body, /\$\{mode\.label\} · \$\{supervision\.label\}/);
+  assert.match(js, /modeLabel\.textContent = modeButtonLabel\(\);/);
+});
+
+/*
+ * `setSetting` is a write primitive taking a key from a message, so the key
+ * is untrusted input. An allow-list keeps it to the five toggles the menu
+ * offers rather than anything under `kiroChat`.
+ */
+test("the panel may only write the settings it shows", () => {
+  assert.match(provider, /const PANEL_SETTINGS = \[/);
+  const handler = provider.slice(provider.indexOf('case "setSetting": {'));
+  const body = handler.slice(0, handler.indexOf("\n        }"));
+  assert.match(
+    body,
+    /if \(!\(PANEL_SETTINGS as readonly string\[\]\)\.includes\(key\)\) break;/,
+    "an unknown key is refused, not written"
+  );
+  assert.match(body, /message\.value === true/, "and only a boolean is written");
+});
+
+/*
+ * The menu is a view of the settings, not a copy. A row flips because the
+ * setting changed — never because it was clicked — so a write that failed
+ * cannot leave a tick claiming a state the setting is not in. The same rule
+ * the permission card follows.
+ */
+test("a settings row waits to be told before it changes", () => {
+  const render = js.slice(js.indexOf("function renderSettingsMenu()"));
+  const body = render.slice(0, render.indexOf("\n  function "));
+  const click = body.slice(body.indexOf('row.addEventListener("click"'));
+  // `=` and not `==`: the loose version matched the `===` in `const on = ...`
+  // and only passed because that line used to sit above the listener.
+  assert.doesNotMatch(click, /settings\[item\.key\] =(?!=)/, "the click must not set the value");
+  assert.doesNotMatch(click, /editMode = /, "nor the mode it just asked for");
+  assert.doesNotMatch(click, /renderSettingsMenu\(\)/, "nor redraw as though it had");
+
+  // Changed anywhere — the settings editor, another window, the JSON — and
+  // the menu has to follow, or it shows a state that is not in force.
+  assert.match(provider, /vscode\.workspace\.onDidChangeConfiguration\(\(event\) => \{/);
+  assert.match(provider, /if \(!event\.affectsConfiguration\("kiroChat"\)\) return;/);
+  assert.match(provider, /this\.postSettings\(\);/);
 });
 
 test("the webview only loads files that exist under media", () => {

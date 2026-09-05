@@ -695,9 +695,24 @@ body.vscode-high-contrast-light .tok-fn {
   gap: 6px;
 }
 
+/*
+ * Hover is a state, not a change of role. This got it backwards.
+ *
+ * `:hover` and `.primary` shared one rule, so putting the pointer on any
+ * option turned it into the recommended action — and because the destructive
+ * one was coloured by `.reject:not(:hover)`, hovering **Reject** dropped its
+ * red and painted it primary blue. The most dangerous button in the panel
+ * became the one that looked recommended, at the exact moment the pointer was
+ * on it. VS Code's own convention is what this follows now: secondary buttons
+ * hover to `button-secondaryHoverBackground`, the primary to
+ * `button-hoverBackground`, and a button never changes what it means.
+ */
 .permission-option {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   width: 100%;
-  padding: 7px 9px;
+  padding: 7px 10px;
   text-align: left;
   color: var(--vscode-button-secondaryForeground);
   background: var(--vscode-button-secondaryBackground);
@@ -706,13 +721,93 @@ body.vscode-high-contrast-light .tok-fn {
   cursor: pointer;
 }
 
-.permission-option:hover:not(:disabled),
+.permission-option:hover:not(:disabled) {
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+/* The recommended action. Hover deepens it; it does not become it. */
 .permission-option.primary {
   color: var(--vscode-button-foreground);
   background: var(--vscode-button-background);
 }
 
-.permission-option.reject:not(:hover) {
+.permission-option.primary:hover:not(:disabled) {
+  background: var(--vscode-button-hoverBackground);
+}
+
+/* Destructive, at rest and under the pointer alike. */
+.permission-option.reject {
+  color: var(--vscode-errorForeground);
+}
+
+.permission-option.reject:hover:not(:disabled) {
+  color: var(--vscode-errorForeground);
+  border-color: var(--vscode-errorForeground);
+  background: var(--vscode-button-secondaryHoverBackground);
+}
+
+/* Keyboard focus has to be visible on its own, not only under a pointer. */
+.permission-option:focus-visible {
+  outline: 1px solid var(--vscode-focusBorder);
+  outline-offset: 2px;
+}
+
+.permission-label {
+  flex: 1;
+  min-width: 0;
+}
+
+/*
+ * The shortcut, as a key rather than a number stuck to the label.
+ *
+ * It read "1  Allow once", which looks like part of the sentence. Drawn as a
+ * key it is plainly a shortcut, and it drops off a card that has been
+ * answered, where there is no shortcut left to offer.
+ */
+.permission-key {
+  flex: 0 0 auto;
+  min-width: 17px;
+  padding: 0 4px;
+  border: 1px solid currentColor;
+  border-radius: 3px;
+  opacity: 0.5;
+  font-size: 0.85em;
+  line-height: 1.5;
+  text-align: center;
+}
+
+.permission-done .permission-key {
+  display: none;
+}
+
+/*
+ * Answered: a record of what was asked, not a question still standing.
+ *
+ * The card keeps the focus-coloured border and the solid primary button of a
+ * live one, so in the transcript it went on looking like something waiting to
+ * be pressed. The choice still has to be legible — that is the whole reason
+ * to keep the card — so it is marked by its outline rather than by a slab of
+ * blue.
+ */
+.permission-done {
+  border-color: var(--vscode-panel-border);
+}
+
+.permission-done .permission-title {
+  color: var(--vscode-descriptionForeground);
+}
+
+.permission-done .permission-option.primary {
+  color: var(--vscode-button-secondaryForeground);
+  background: var(--vscode-button-secondaryBackground);
+}
+
+/*
+ * The request had already gone — the turn ended, was stopped, or errored —
+ * so the click reached nobody. Saying that is the whole point: this card used
+ * to report the approval as though it had landed.
+ */
+.permission-stale .permission-status {
   color: var(--vscode-errorForeground);
 }
 
@@ -1223,6 +1318,113 @@ button:disabled {
 
 .popup button:hover {
   background: var(--vscode-list-hoverBackground);
+}
+
+/* --- menu group headings ----------------------------------------- */
+
+/*
+ * The mode menu carries three groups now — workflow, supervision, and what
+ * rides along with a message — so its rows need something to be grouped by.
+ * Supervision used to sit behind a gear of its own, which put "how closely am
+ * I watching Kiro" somewhere quite different from "how is Kiro approaching
+ * this task": two halves of one question, and one of them dressed as
+ * configuration rather than a working choice.
+ */
+.menu-head {
+  padding: 8px 10px 3px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.78em;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.menu-head:not(:first-child) {
+  margin-top: 4px;
+  border-top: 1px solid var(--vscode-panel-border);
+  padding-top: 9px;
+}
+
+/*
+ * A toggle row: label on the left, switch on the right.
+ *
+ * The group above it is one-of and marks its choice with the selection
+ * highlight. Marking a toggle the same way merged two switched-on rows into a
+ * single blue slab, and reads as "these were all chosen" directly under a
+ * group that means "only this one". A switch says on-or-off on its own.
+ */
+.mode-row.toggle {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.mode-row.toggle .mode-name {
+  flex: 1;
+  min-width: 0;
+  font-weight: normal;
+}
+
+/*
+ * The switch itself.
+ *
+ * This was a "✓" / "○" character — a glyph pretending to be a control.
+ * Nothing about it said it could be flipped, its two states were different
+ * *shapes* rather than one thing moved, and it took whatever colour the text
+ * happened to be. The knob slides and the track fills, which is the shape
+ * every other application uses for this and reads without being explained.
+ */
+.menu-switch {
+  position: relative;
+  flex: 0 0 auto;
+  width: 26px;
+  height: 15px;
+  border-radius: 999px;
+  border: 1px solid var(--vscode-descriptionForeground);
+  background: transparent;
+  transition:
+    background-color 120ms ease,
+    border-color 120ms ease;
+}
+
+.menu-switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--vscode-descriptionForeground);
+  transition:
+    transform 120ms ease,
+    background-color 120ms ease;
+}
+
+[aria-checked="true"] > .menu-switch {
+  border-color: var(--vscode-button-background);
+  background: var(--vscode-button-background);
+}
+
+[aria-checked="true"] > .menu-switch::after {
+  background: var(--vscode-button-foreground);
+  transform: translateX(11px);
+}
+
+/* The knob's position is the state; sliding to it is only decoration. */
+@media (prefers-reduced-motion: reduce) {
+  .menu-switch,
+  .menu-switch::after {
+    transition: none;
+  }
+}
+
+/* Said only when it is the case: Plan changes nothing, or the settings match
+   no named mode. Never a row, because neither is something to pick. */
+.menu-note {
+  padding: 0 10px 5px;
+  color: var(--vscode-descriptionForeground);
+  font-size: 0.8em;
+  line-height: 1.4;
 }
 
 /* --- mode and model menus ----------------------------------------- */
@@ -1863,6 +2065,25 @@ button:disabled {
  * The per-hunk review already decided each edit; this is the question about
  * all of them together.
  */
+/*
+ * Pinned between the transcript and the message box, like the keep-or-undo
+ * bar and for the same reason: the turn is blocked on this question, and in
+ * the transcript it scrolls away exactly when it is needed — Kiro keeps
+ * streaming, the view keeps moving, and the thing waiting on an answer ends up
+ * somewhere above. Answered cards are moved into the conversation, so this is
+ * empty and hidden whenever nothing is being asked.
+ */
+.permission-bar {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* More than a couple of questions at once and it may scroll itself rather
+     than pushing the message box off the bottom of a short panel. */
+  max-height: 45vh;
+  overflow-y: auto;
+}
+
 .change-bar {
   flex: 0 0 auto;
   padding: 9px 11px;

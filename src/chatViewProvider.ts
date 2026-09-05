@@ -16,6 +16,7 @@ import {
   SelectionContext,
 } from "./context";
 import { ActiveFile, attachmentsForMessage } from "./activeFile";
+import { EditGates, editModeOf, gatesForMode } from "./editModes";
 import { parseDroppedPaths } from "./dropped";
 import { findKiro } from "./findKiro";
 import { SetupWatcher } from "./setupWatcher";
@@ -42,6 +43,42 @@ const MAX_CHATS = 100;
  */
 const MAX_PREVIEW_BYTES = 4 * 1024 * 1024;
 
+/**
+ * How long a pending permission survives the view going away.
+ *
+ * `onDidDispose` cannot tell a panel being dragged from one being closed for
+ * good — both destroy the webview, and only what happens next tells them
+ * apart: a drag resolves a new view within milliseconds, a close never does.
+ * Cancelling immediately answered Kiro on the user's behalf every time they
+ * rearranged their editor; not cancelling at all left Kiro waiting on a panel
+ * that was never coming back. Waiting turns the guess into an observation.
+ *
+ * Thirty seconds is far longer than a drag and short enough that an abandoned
+ * turn is not left hanging. Nothing is lost by being wrong in the slow
+ * direction: this is the behaviour the code already had, only delayed.
+ */
+const PERMISSION_GRACE_MS = 30_000;
+
+/**
+ * The settings the panel is allowed to write, and the only ones.
+ *
+ * `setSetting` takes a key from the webview, so it is a write primitive with
+ * an untrusted argument. An allow-list keeps it to the five toggles the menu
+ * actually offers rather than letting anything in the `kiroChat` section — or
+ * a mistyped one — be set from a message.
+ *
+ * All five are booleans with a declared default in package.json, which is
+ * what makes reading them uniform.
+ */
+const PANEL_SETTINGS = [
+  "allowFileWrites",
+  "reviewFileWrites",
+  "askBeforeEdits",
+  "autoApproveTools",
+  "attachActiveFile",
+  "sendSelection",
+] as const;
+
 function freshId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
 }
@@ -67,9 +104,23 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private everConnected = false;
   private selection: SelectionContext | undefined;
   private selectionTimer: NodeJS.Timeout | undefined;
+  /**
+   * Permission requests Kiro is still waiting on.
+   *
+   * The request itself is kept beside its resolver, not just the resolver,
+   * because the webview is destroyed and rebuilt whenever the panel is
+   * dragged between the sidebar, the bottom panel and the secondary sidebar.
+   * The card goes with it, and the question has to be asked again on the
+   * other side; see `repostPermissions`.
+   */
+  /** Runs while the view is gone but might still come back. */
+  private permissionGrace: NodeJS.Timeout | undefined;
   private readonly pendingPermissions = new Map<
     string,
-    (optionId: string | undefined) => void
+    {
+      resolve: (optionId: string | undefined) => void;
+      request: { title: string; options: Array<{ id: string; label: string; kind: string }> };
+    }
   >();
 
   /** Watches for Kiro appearing and connects, so the user need not click. */
@@ -132,11 +183,29 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     // Track where the user is working, so the chip stays current.
     this.watchers.push(
       vscode.window.onDidChangeTextEditorSelection(() => this.refreshSelection()),
-      vscode.window.onDidChangeActiveTextEditor(() => this.refreshSelection())
+      vscode.window.onDidChangeActiveTextEditor(() => this.refreshSelection()),
+      /*
+       * The settings menu is a view of the settings, not a copy of them.
+       *
+       * Changing one in the VS Code settings editor, in another window, or in
+       * the JSON has to reach the menu too, or the panel shows a state that is
+       * not the one in force. It is also what confirms the menu's own writes:
+       * a row flips because the setting changed, never because it was clicked.
+       */
+      vscode.workspace.onDidChangeConfiguration((event) => {
+        if (!event.affectsConfiguration("kiroChat")) return;
+        this.postSettings();
+        // `attachActiveFile` decides whether there is a file chip at all.
+        this.refreshSelection(true);
+      })
     );
   }
 
   resolveWebviewView(view: vscode.WebviewView): void {
+    // A view came back, so the last dispose was a move rather than a close.
+    // The questions Kiro is still waiting on are re-posted by
+    // `onWebviewReady`; all this has to do is call off their execution.
+    this.keepPermissionsAlive();
     this.view = view;
     view.webview.options = {
       enableScripts: true,
@@ -158,8 +227,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
           );
           break;
         case "stop":
-          this.cancelPendingPermissions();
-          this.session.cancel();
+          // Through `stop()`, not around it. This case used to cancel pending
+          // permissions and the `kiroChat.stop` command did not, so stopping
+          // from the Command Palette left a live card answering to nobody.
+          this.stop();
           break;
         case "new":
           await this.newSession();
@@ -236,12 +307,55 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
         case "showLog":
           this.output.show(true);
           break;
+        case "setEditMode": {
+          /*
+           * One click, four settings. `gatesForMode` refuses anything that is
+           * not a named mode, so `custom` — which is a reading of the settings
+           * rather than a choice — cannot be applied, and neither can a
+           * mistyped name.
+           */
+          const gates = gatesForMode(String(message.mode ?? ""));
+          if (!gates) break;
+          const config = vscode.workspace.getConfiguration("kiroChat");
+          for (const [key, value] of Object.entries(gates)) {
+            await config.update(key, value, vscode.ConfigurationTarget.Global);
+          }
+          break;
+        }
+        case "setSetting": {
+          const key = String(message.key ?? "");
+          // An untrusted key from a message is not a licence to write any
+          // setting in the section, or one that does not exist.
+          if (!(PANEL_SETTINGS as readonly string[]).includes(key)) break;
+          await vscode.workspace
+            .getConfiguration("kiroChat")
+            .update(key, message.value === true, vscode.ConfigurationTarget.Global);
+          // Nothing is posted back here. The configuration watcher sees the
+          // write land and re-posts, so a toggle that failed does not leave a
+          // row claiming a state the setting is not in.
+          break;
+        }
         case "permissionDecision": {
           const requestId = String(message.requestId ?? "");
-          const resolve = this.pendingPermissions.get(requestId);
-          if (!resolve) break;
+          const pending = this.pendingPermissions.get(requestId);
+          /*
+           * The card is told either way, and only writes its answer down when
+           * it hears back.
+           *
+           * It used to disable itself and say "Selected: Allow" the instant it
+           * was clicked, whatever happened next. A request that had already
+           * gone — the turn ended, was stopped, or errored — was dropped here
+           * in silence, so a card sat in the transcript claiming an approval
+           * that never reached Kiro.
+           */
+          if (!pending) {
+            this.post({ type: "permissionSettled", requestId, ok: false });
+            break;
+          }
           this.pendingPermissions.delete(requestId);
-          resolve(message.optionId === undefined ? undefined : String(message.optionId));
+          const optionId = message.optionId === undefined ? undefined : String(message.optionId);
+          pending.resolve(optionId);
+          this.post({ type: "permissionSettled", requestId, ok: true, optionId });
           break;
         }
         case "transcript":
@@ -280,7 +394,20 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
 
     view.onDidDispose(() => {
       this.view = undefined;
-      this.cancelPendingPermissions();
+      /*
+       * Pending permissions get a stay of execution, not a pardon.
+       *
+       * Dragging the panel between the sidebar, the bottom panel and the
+       * secondary sidebar disposes the view and resolves a new one — the same
+       * conversation, a new webview. Cancelling here answered Kiro on the
+       * user's behalf for a move made for layout reasons, and told nobody.
+       * Never cancelling is the opposite mistake: a view closed for good would
+       * leave Kiro waiting on a card that is not coming back.
+       *
+       * So wait and see. `resolveWebviewView` calls this off; if nothing
+       * resolves, the timer does what this line used to do immediately.
+       */
+      this.schedulePermissionCancel();
       // Nothing left to report progress to, and the poll would outlive the panel.
       this.setup.stop();
     });
@@ -536,6 +663,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   private async onWebviewReady(restored: boolean): Promise<void> {
     this.refreshSelection(true);
     this.postAttachments();
+    // A question Kiro is still waiting on outlived the panel being rebuilt,
+    // so put the card back rather than leaving the turn stuck behind one the
+    // user can no longer see.
+    this.repostPermissions();
 
     const state = this.session.getModels();
     if (state.models.length > 0) {
@@ -543,14 +674,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     }
     this.post({ type: "capabilities", caps: { image: this.session.canSendImages } });
     this.post({ type: "status", status: this.session.currentStatus });
-    // This setting was declared but never read, so the toggle did nothing.
-    // It seeds whether the highlighted code goes with the first message.
-    this.post({
-      type: "defaults",
-      sendSelection: vscode.workspace
-        .getConfiguration("kiroChat")
-        .get<boolean>("sendSelection", true),
-    });
+    this.postSettings();
 
     if (restored) {
       const usage = this.session.getUsage();
@@ -583,6 +707,27 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     void this.view?.webview.postMessage(message);
   }
 
+  /**
+   * The five toggles the panel shows, as they actually are right now.
+   *
+   * This replaced a `defaults` message that carried `sendSelection` alone.
+   * Adding the menu beside it would have given that one setting two writers in
+   * the webview — the exact drift this codebase keeps paying for elsewhere —
+   * so there is one message, and `includeSelection` is derived from it.
+   */
+  private postSettings(): void {
+    const config = vscode.workspace.getConfiguration("kiroChat");
+    const settings: Record<string, boolean> = {};
+    for (const key of PANEL_SETTINGS) settings[key] = Boolean(config.get<boolean>(key));
+    // Derived here rather than stored, so it cannot disagree with the settings
+    // it describes — and reported as `custom` when it matches no mode.
+    this.post({
+      type: "settings",
+      settings,
+      editMode: editModeOf(settings as unknown as EditGates),
+    });
+  }
+
   private requestPermissionInChat(request: {
     title: string;
     options: Array<{ id: string; label: string; kind: string }>;
@@ -590,13 +735,67 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (!this.view) return Promise.resolve(undefined);
     const requestId = freshId();
     return new Promise((resolve) => {
-      this.pendingPermissions.set(requestId, resolve);
+      this.pendingPermissions.set(requestId, { resolve, request });
       this.post({ type: "permission", permission: { requestId, ...request } });
     });
   }
 
+  /**
+   * Ask again after the panel has been rebuilt.
+   *
+   * Moving the view destroys the webview, and the card with it. This used to
+   * answer Kiro "cancelled" on the user's behalf and say so nowhere: the
+   * action they were being asked about simply did not happen, and the panel
+   * that came back showed no sign there had ever been a question. The request
+   * is still open on Kiro's side, so the honest thing is to put it back.
+   */
+  private repostPermissions(): void {
+    for (const [requestId, pending] of this.pendingPermissions) {
+      this.post({ type: "permission", permission: { requestId, ...pending.request } });
+    }
+  }
+
+  /**
+   * The view has gone. Give it a moment to come back before answering for it.
+   *
+   * Nothing is scheduled when there is nothing outstanding, so the ordinary
+   * case — closing a panel with no question on screen — starts no timer at
+   * all.
+   */
+  private schedulePermissionCancel(): void {
+    if (this.pendingPermissions.size === 0) return;
+    this.keepPermissionsAlive();
+    this.permissionGrace = setTimeout(() => {
+      this.permissionGrace = undefined;
+      if (this.pendingPermissions.size === 0) return;
+      // Said out loud, because nobody is looking at a panel to be told.
+      this.output.appendLine(
+        `The chat panel closed with ${this.pendingPermissions.size} permission request(s) ` +
+          `still open. Answering Kiro "cancelled" for them.`
+      );
+      this.cancelPendingPermissions();
+    }, PERMISSION_GRACE_MS);
+  }
+
+  /** A view resolved, or we are tearing down for real. Call off the timer. */
+  private keepPermissionsAlive(): void {
+    if (!this.permissionGrace) return;
+    clearTimeout(this.permissionGrace);
+    this.permissionGrace = undefined;
+  }
+
+  /**
+   * Answer everything still open with "cancelled".
+   *
+   * Every card is told, so none is left looking live. A card whose request has
+   * gone is worse than no card: its buttons still work, and clicking one used
+   * to report a decision that reached nobody.
+   */
   private cancelPendingPermissions(): void {
-    for (const resolve of this.pendingPermissions.values()) resolve(undefined);
+    for (const [requestId, pending] of this.pendingPermissions) {
+      pending.resolve(undefined);
+      this.post({ type: "permissionSettled", requestId, ok: false });
+    }
     this.pendingPermissions.clear();
   }
 
@@ -898,6 +1097,10 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   }
 
   stop(): void {
+    // Abandoning the turn abandons every question it was still asking. Both
+    // the Stop button and the `kiroChat.stop` command land here so they cannot
+    // disagree about that.
+    this.cancelPendingPermissions();
     this.session.cancel();
   }
 
@@ -922,6 +1125,9 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
     if (this.selectionTimer) clearTimeout(this.selectionTimer);
     // A debounced save must not be lost to the window closing.
     this.flushChats();
+    // No waiting to see here: this is the real teardown, and a timer left
+    // running would outlive the thing it was going to act on.
+    this.keepPermissionsAlive();
     this.cancelPendingPermissions();
     for (const w of this.watchers) w.dispose();
     this.setup.stop();
@@ -1074,6 +1280,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider, vscode.Disp
   <div id="dropzone" class="dropzone" hidden><span>Drop anywhere here to attach</span></div>
 
   <form id="composer" class="composer">
+    <div id="permission-bar" class="permission-bar" hidden></div>
     <div id="change-bar" class="change-bar" hidden></div>
     <div id="chips" class="chips" hidden></div>
 

@@ -13,6 +13,7 @@
   const chipsEl = el("chips");
   const attachBtn = el("attach");
   const attachMenu = el("attach-menu");
+  const permissionBar = el("permission-bar");
   const modeBtn = el("mode-btn");
   const modeLabel = el("mode-label");
   const modeMenu = el("mode-menu");
@@ -59,6 +60,10 @@
   let attachments = [];
   let selection = null;
   let includeSelection = true;
+  /** The kiroChat settings the menu shows, as the extension last reported them. */
+  let settings = {};
+  /** Which supervision mode those settings add up to, or "custom" for none. */
+  let editMode = "custom";
   /** The file the editor is showing, sent with the message like Copilot does. */
   let activeFile = null;
   let includeActiveFile = true;
@@ -131,6 +136,32 @@
 
   function recordSimple(role, text) {
     history.push({ role, text });
+    saveState();
+  }
+
+  /**
+   * Keep the question and the answer in the chat's own record.
+   *
+   * A permission card lived only in the DOM, so reopening a chat — or moving
+   * the panel — left no trace that Kiro had asked to do something, or what
+   * was said back. For the one feature whose whole point is being asked
+   * before something happens, that is the record most worth having.
+   */
+  function recordPermission(card, settled) {
+    const buttons = [...card.querySelectorAll(".permission-actions button")];
+    const chosen = card.querySelector("button.chosen");
+    const status = card.querySelector(".permission-status");
+    history.push({
+      role: "permission",
+      title: card.dataset.title || "",
+      options: buttons.map((b) => ({
+        id: b.dataset.optionId,
+        label: b.dataset.label,
+        kind: b.dataset.kind || "",
+      })),
+      chosenId: settled && settled.ok && chosen ? chosen.dataset.optionId : "",
+      statusText: status ? status.textContent : "",
+    });
     saveState();
   }
 
@@ -825,12 +856,21 @@
     return row;
   }
 
+  /**
+   * The card that asks before Kiro acts.
+   *
+   * `permission.settled` renders one that has already been answered — a card
+   * restored from a stored chat. It is the same card with its buttons spent,
+   * rather than a second way of drawing the same thing.
+   */
   function addPermissionCard(permission) {
     const was = atBottom();
-    const bubble = ensureAgentBubble();
     const card = document.createElement("section");
     card.className = "permission-card";
     card.dataset.requestId = permission.requestId;
+    // Kept raw, so the card can be written to the transcript and rebuilt from
+    // it without having to unpick the sentence it is shown in.
+    card.dataset.title = String(permission.title || "");
 
     const title = document.createElement("div");
     title.className = "permission-title";
@@ -842,18 +882,55 @@
     const status = document.createElement("div");
     status.className = "permission-status";
 
-    (permission.options || []).forEach((option, index) => {
+    const options = permission.options || [];
+    /*
+     * Only an allow may be the primary button.
+     *
+     * The rule was `kind.startsWith("allow") || index === 0`, so if Kiro ever
+     * sent the refusal first it was painted as the recommended action — and
+     * given both classes at once. Falling back to the first option is still
+     * right when nothing declares itself an allow; it just must not overrule
+     * an explicit reject.
+     */
+    const declaresAllow = options.some((o) =>
+      String(o.kind || "").toLowerCase().startsWith("allow")
+    );
+
+    options.forEach((option, index) => {
       const button = document.createElement("button");
       button.type = "button";
       button.className = "permission-option";
+      button.dataset.optionId = String(option.id);
+      button.dataset.label = String(option.label);
       const kind = String(option.kind || "").toLowerCase();
-      if (kind.startsWith("allow") || index === 0) button.classList.add("primary");
-      if (kind.includes("reject") || kind.includes("deny")) button.classList.add("reject");
-      button.textContent = `${index + 1}  ${option.label}`;
+      button.dataset.kind = kind;
+      const isReject = kind.includes("reject") || kind.includes("deny");
+      if (isReject) button.classList.add("reject");
+      else if (kind.startsWith("allow") || (!declaresAllow && index === 0)) {
+        button.classList.add("primary");
+      }
+      const label = document.createElement("span");
+      label.className = "permission-label";
+      label.textContent = option.label;
+      const key = document.createElement("span");
+      key.className = "permission-key";
+      key.textContent = String(index + 1);
+      button.append(label, key);
+      button.title = `${option.label} — or press ${index + 1}`;
       button.addEventListener("click", () => {
+        /*
+         * Clicking spends the buttons but claims nothing.
+         *
+         * This used to write "Selected: Allow" on the spot, whatever became of
+         * the decision. A request that had already gone — the turn ended, was
+         * stopped, or errored — is dropped by the extension in silence, so the
+         * card sat in the transcript reporting an approval that never reached
+         * Kiro. The answer is written down in `permissionSettled`, when there
+         * is something to write.
+         */
         for (const other of actions.querySelectorAll("button")) other.disabled = true;
         button.classList.add("chosen");
-        status.textContent = `Selected: ${option.label}`;
+        status.textContent = "Sending…";
         vscode.postMessage({
           type: "permissionDecision",
           requestId: permission.requestId,
@@ -864,10 +941,70 @@
     });
 
     card.append(actions, status);
-    // Never inside the steps list: that folds shut, and a permission the user
-    // cannot see is one they cannot answer — the turn would just hang.
+
+    /*
+     * A question is pinned; an answer is history.
+     *
+     * A live card goes in `#permission-bar`, between the transcript and the
+     * message box, for the same reason the keep-or-undo bar lives there: the
+     * turn is blocked on it, and in the transcript it scrolls away exactly
+     * when it is needed — Kiro keeps streaming, the view keeps moving, and
+     * the thing waiting on you is somewhere above. A settled one is a record
+     * of what was asked, so it belongs in the conversation with everything
+     * else that happened.
+     *
+     * Neither ever goes inside the steps list, which folds shut: a permission
+     * the user cannot see is one they cannot answer, and the turn would hang.
+     */
+    if (permission.settled) {
+      for (const button of actions.querySelectorAll("button")) {
+        button.disabled = true;
+        if (button.dataset.optionId === String(permission.chosenId)) {
+          button.classList.add("chosen");
+        }
+      }
+      status.textContent = permission.statusText || "";
+      card.classList.add("permission-done");
+      const bubble = ensureAgentBubble();
+      bubble.root.insertBefore(card, bubble.body);
+      scroll(was);
+      return card;
+    }
+
+    permissionBar.appendChild(card);
+    permissionBar.hidden = false;
+    return card;
+  }
+
+  /** Move an answered card out of the pinned bar and into the conversation. */
+  function retirePermissionCard(card) {
+    const was = atBottom();
+    card.remove();
+    permissionBar.hidden = permissionBar.children.length === 0;
+    const bubble = ensureAgentBubble();
     bubble.root.insertBefore(card, bubble.body);
     scroll(was);
+  }
+
+  /** A card by request id, wherever it is — pinned bar or transcript. */
+  function findPermissionCard(requestId) {
+    return document.querySelector(
+      `.permission-card[data-request-id="${CSS.escape(String(requestId))}"]`
+    );
+  }
+
+  /**
+   * The card that is still waiting for an answer, if there is one.
+   *
+   * The newest, because a turn can ask more than once and the last one asked
+   * is the one on screen.
+   */
+  function livePermissionCard() {
+    const cards = permissionBar.querySelectorAll(".permission-card:not(.permission-done)");
+    for (let i = cards.length - 1; i >= 0; i -= 1) {
+      if (!cards[i].querySelector("button.chosen")) return cards[i];
+    }
+    return null;
   }
 
   let repaintQueued = false;
@@ -1023,38 +1160,200 @@
     renderModelMenu();
   }
 
-  function renderModeMenu() {
-    modeMenu.innerHTML = "";
-    for (const mode of CHAT_MODES) {
-      const row = document.createElement("button");
-      row.type = "button";
-      row.className = "mode-row";
-      row.setAttribute("role", "option");
-      row.setAttribute("aria-selected", mode.id === currentModeId ? "true" : "false");
-      if (mode.id === currentModeId) row.classList.add("selected");
-      row.dataset.modeId = mode.id;
+  function menuHeading(text, note) {
+    const head = document.createElement("div");
+    head.className = "menu-head";
+    head.textContent = text;
+    modeMenu.appendChild(head);
+    if (!note) return;
+    const line = document.createElement("div");
+    line.className = "menu-note";
+    line.textContent = note;
+    modeMenu.appendChild(line);
+  }
 
-      const name = document.createElement("div");
-      name.className = "mode-name";
-      name.textContent = mode.label;
-      row.appendChild(name);
+  function menuRow(options) {
+    const row = document.createElement("button");
+    row.type = "button";
+    row.className = "mode-row";
+    const toggle = options.role === "switch";
+    row.setAttribute("role", toggle ? "switch" : "option");
+    row.setAttribute(toggle ? "aria-checked" : "aria-selected", options.on ? "true" : "false");
+    /*
+     * The two indicators are different on purpose.
+     *
+     * A one-of group is marked by the selection highlight, which is what the
+     * workflow list already used. A toggle is marked by its tick and keeps the
+     * plain background: two adjacent switched-on rows both wearing the
+     * highlight merged into a single blue slab with no boundary between them,
+     * and a highlight on several rows at once reads as "these were all
+     * chosen" in a menu where the group above means "only this one".
+     */
+    if (options.on && !toggle) row.classList.add("selected");
 
+    const name = document.createElement("div");
+    name.className = "mode-name";
+    name.textContent = options.label;
+
+    if (toggle) {
+      /*
+       * A drawn switch, not a character.
+       *
+       * A "✓" or "○" in front of the label is a glyph pretending to be a
+       * control: nothing about it says it can be flipped, the two states are
+       * different *shapes* rather than the same thing moved, and it inherits
+       * whatever the text colour happens to be. The switch is the shape every
+       * other application uses for exactly this, and it reads at a glance.
+       */
+      row.classList.add("toggle");
+      const track = document.createElement("span");
+      track.className = "menu-switch";
+      track.setAttribute("aria-hidden", "true");
+      row.append(name, track);
+      return row;
+    }
+
+    row.appendChild(name);
+    if (options.description) {
       const desc = document.createElement("div");
       desc.className = "mode-desc";
-      desc.textContent = mode.description;
+      desc.textContent = options.description;
       row.appendChild(desc);
+    }
+    return row;
+  }
+
+  /*
+   * One menu for how the conversation runs.
+   *
+   * Supervision used to live behind a settings gear of its own, which put
+   * "how closely am I watching Kiro" somewhere quite different from "how is
+   * Kiro approaching this task" — two halves of the same question, two
+   * controls, and one of them looking like configuration rather than a
+   * working choice. They are three groups of one menu now, and the gear is
+   * gone.
+   *
+   * They stay separate groups rather than one flat list because they are
+   * genuinely independent: Spec with Autopilot and Spec with Manual are both
+   * sensible, and a single list of eight could not say that.
+   */
+  function renderModeMenu() {
+    modeMenu.innerHTML = "";
+
+    menuHeading("Workflow");
+    for (const mode of CHAT_MODES) {
+      const row = menuRow({
+        label: mode.label,
+        description: mode.description,
+        on: mode.id === currentModeId,
+      });
+      row.dataset.modeId = mode.id;
       modeMenu.appendChild(row);
     }
+
+    // Plan is read-only, so nothing below applies while it is selected.
+    // Better to say that than to leave a group that quietly does nothing.
+    menuHeading(
+      "When Kiro edits a file",
+      currentModeId === "plan" ? "Plan makes no changes, so this does not apply to it." : ""
+    );
+    for (const mode of EDIT_MODES) {
+      const row = menuRow({
+        label: mode.label,
+        description: mode.hint,
+        on: editMode === mode.id,
+      });
+      row.dataset.editMode = mode.id;
+      modeMenu.appendChild(row);
+    }
+    if (editMode === "custom") {
+      const note = document.createElement("div");
+      note.className = "menu-note";
+      note.textContent = "Your settings match none of these. Pick one to replace them.";
+      modeMenu.appendChild(note);
+    }
+
+    menuHeading("Sent with each message");
+    for (const item of MESSAGE_TOGGLES) {
+      const row = menuRow({
+        role: "switch",
+        label: item.label,
+        on: settings[item.key] === true,
+      });
+      row.dataset.setting = item.key;
+      modeMenu.appendChild(row);
+    }
+  }
+
+  /**
+   * What the button says.
+   *
+   * Review is the default and needs no announcing. Manual and Autopilot
+   * change what happens to your files without any other sign on screen, so
+   * they ride on the button where they cannot be missed.
+   */
+  function modeButtonLabel() {
+    const mode = CHAT_MODES.find((m) => m.id === currentModeId) || CHAT_MODES[0];
+    if (currentModeId === "plan" || editMode === "review" || editMode === "custom") {
+      return mode.label;
+    }
+    const supervision = EDIT_MODES.find((m) => m.id === editMode);
+    return supervision ? `${mode.label} · ${supervision.label}` : mode.label;
   }
 
   function setMode(modeId, persist = true) {
     const mode = CHAT_MODES.find((candidate) => candidate.id === modeId) || CHAT_MODES[0];
     currentModeId = mode.id;
-    modeLabel.textContent = mode.label;
+    modeLabel.textContent = modeButtonLabel();
     modeBtn.title = `${mode.label}: ${mode.description}`;
     renderModeMenu();
     if (persist) saveState();
   }
+
+  /*
+   * The settings worth reaching from the chat, and the wording that makes
+   * them make sense together.
+   *
+   * `reviewFileWrites` is the reason this menu exists. Its name reads like
+   * "check my edits more", so turning it off looks like turning safety off —
+   * when what it really does is swap which of the two gates you get: the diff
+   * you can read, or a prompt asked before there is anything to look at. The
+   * hints say that, because the setting name cannot.
+   */
+  /*
+   * How closely Kiro is supervised, as one choice rather than four booleans.
+   *
+   * `reviewFileWrites`, `askBeforeEdits`, `allowFileWrites` and
+   * `autoApproveTools` are a spectrum wearing a bad disguise, and their names
+   * mislead: turning "review file writes" off reads as turning safety off,
+   * when it only swaps which gate you get. The extension derives which of
+   * these the settings are in and sends it as `editMode`; picking one writes
+   * all four. `custom` is a reading, never an option — a combination nobody
+   * named is reported as what it is rather than rounded to the nearest mode.
+   */
+  const EDIT_MODES = [
+    {
+      id: "manual",
+      label: "Manual",
+      hint: "Ask before every edit, then show the diff.",
+    },
+    {
+      id: "review",
+      label: "Review",
+      hint: "Make the edit, then show me the diff to keep or undo.",
+    },
+    {
+      id: "autopilot",
+      label: "Autopilot",
+      hint: "Edit freely. Nothing to approve, nothing to read.",
+    },
+  ];
+
+  /** What rides along with a message, independent of everything above. */
+  const MESSAGE_TOGGLES = [
+    { key: "attachActiveFile", label: "The file I am looking at" },
+    { key: "sendSelection", label: "The code I have highlighted" },
+  ];
 
   function setMenu(menu, button, open) {
     menu.hidden = !open;
@@ -1077,8 +1376,32 @@
   modeMenu.addEventListener("click", (event) => {
     const row = event.target.closest(".mode-row");
     if (!row) return;
-    setMode(row.dataset.modeId);
-    setMenu(modeMenu, modeBtn, false);
+
+    if (row.dataset.modeId) {
+      setMode(row.dataset.modeId);
+      // Picking a workflow is the whole errand; the menu has done its job.
+      setMenu(modeMenu, modeBtn, false);
+      return;
+    }
+
+    /*
+     * Supervision and the message toggles ask and wait, the way every other
+     * setting here does — the row redraws when the extension reports the
+     * change, never on the click. The menu deliberately stays open for these:
+     * they are things you might set two of, and staying put is what shows the
+     * change landing.
+     */
+    if (row.dataset.editMode) {
+      vscode.postMessage({ type: "setEditMode", mode: row.dataset.editMode });
+      return;
+    }
+    if (row.dataset.setting) {
+      vscode.postMessage({
+        type: "setSetting",
+        key: row.dataset.setting,
+        value: settings[row.dataset.setting] !== true,
+      });
+    }
   });
 
   modelBtn.addEventListener("click", () => {
@@ -1418,6 +1741,7 @@
     setMenu(attachMenu, attachBtn, open);
   });
 
+
   attachMenu.addEventListener("click", (event) => {
     const btn = event.target.closest("[data-act]");
     if (!btn) return;
@@ -1441,6 +1765,37 @@
   });
 
   document.addEventListener("keydown", (event) => {
+    /*
+     * The numbers on a permission card are a promise, and it was not kept.
+     *
+     * Options render as "1  Allow", "2  Reject", which every terminal prompt
+     * has taught people to read as "press that key". Nothing listened for
+     * them: with the composer focused — which it is for most of a turn, since
+     * only Send is disabled while Kiro works — pressing 1 typed a 1 into the
+     * message box.
+     *
+     * An empty composer means nothing is being written, and a permission card
+     * means the turn is blocked on an answer, so a digit there is unambiguous.
+     * With text in the box the digit is text and the buttons are still there
+     * to click; the promise is kept exactly where it can be.
+     */
+    if (/^[1-9]$/.test(event.key) && !event.ctrlKey && !event.metaKey && !event.altKey) {
+      const el = event.target;
+      const writing =
+        el &&
+        (el.tagName === "INPUT" ||
+          el.isContentEditable ||
+          (el.tagName === "TEXTAREA" && String(el.value || "").trim() !== ""));
+      const card = writing ? null : livePermissionCard();
+      const button =
+        card && card.querySelectorAll(".permission-actions button")[Number(event.key) - 1];
+      if (button && !button.disabled) {
+        event.preventDefault();
+        button.click();
+        return;
+      }
+    }
+
     if (event.key !== "Escape") return;
     closeMenus();
     setUsagePanel(false);
@@ -2353,14 +2708,28 @@
         break;
       }
 
-      case "defaults":
-        // The setting decides this on its own now. The chip reports the
-        // highlight rather than switching it off, so there is no per-message
-        // choice left for a restored panel to protect.
-        if (typeof message.sendSelection === "boolean") {
-          includeSelection = message.sendSelection;
-          renderChips();
+      /*
+       * The settings, as they actually are. One message, not two.
+       *
+       * `sendSelection` used to arrive on its own as `defaults`; adding the
+       * menu beside that would have given one setting two writers in here,
+       * which is the drift this file keeps paying for. The chip reports the
+       * highlight rather than switching it off, so there is no per-message
+       * choice left for a restored panel to protect either.
+       */
+      case "settings":
+        settings = message.settings || {};
+        // Derived by the extension from those same settings, so it can never
+        // disagree with them.
+        editMode = message.editMode || "custom";
+        if (typeof settings.sendSelection === "boolean") {
+          includeSelection = settings.sendSelection;
         }
+        // The mode menu carries all of this now, and the button label shows
+        // supervision when it is not the default.
+        modeLabel.textContent = modeButtonLabel();
+        renderModeMenu();
+        renderChips();
         break;
 
       case "attachments":
@@ -2460,8 +2829,42 @@
         break;
       }
 
-      case "permission":
-        addPermissionCard(message.permission || {});
+      case "permission": {
+        const asked = message.permission || {};
+        // A rebuilt panel is sent the same question again, so an id already on
+        // screen is that question, not a second one.
+        const already = findPermissionCard(asked.requestId);
+        if (!already) addPermissionCard(asked);
+        break;
+      }
+
+      /*
+       * The extension has answered: the decision reached Kiro, or it did not.
+       *
+       * Only here does the card write down what happened. `ok: false` means
+       * the request had already gone — the turn ended, was stopped, or the
+       * panel was torn down — and a card that goes on looking live is worse
+       * than one that says so.
+       */
+      case "permissionSettled": {
+        const card = findPermissionCard(message.requestId);
+        if (!card) break;
+        const status = card.querySelector(".permission-status");
+        const chosen = card.querySelector("button.chosen");
+        card.classList.add("permission-done");
+        for (const button of card.querySelectorAll("button")) button.disabled = true;
+        if (message.ok) {
+          const label = (chosen && chosen.dataset.label) || "your answer";
+          if (status) status.textContent = `Selected: ${label}`;
+        } else if (status) {
+          status.textContent = "This request is no longer waiting for an answer.";
+          card.classList.add("permission-stale");
+        }
+        recordPermission(card, message);
+        // Answered, so it stops blocking the composer and joins the record.
+        retirePermissionCard(card);
+        break;
+      }
         break;
 
       case "turnEnd":
@@ -2596,6 +2999,17 @@
     for (const item of saved) {
       if (item.role === "user") {
         addUserBubble(item);
+      } else if (item.role === "permission") {
+        // The same card, with its buttons spent. A second way of drawing an
+        // answered permission would be a second thing to keep in step.
+        addPermissionCard({
+          requestId: "restored-" + saved.indexOf(item),
+          title: item.title,
+          options: item.options || [],
+          settled: true,
+          chosenId: item.chosenId,
+          statusText: item.statusText,
+        });
       } else if (item.role === "agent") {
         const bubble = ensureAgentBubble();
         const steps = item.tools || [];
